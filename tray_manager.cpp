@@ -119,8 +119,16 @@ void showTrayMenu(HWND hwnd, GlobalState& state) {
     
     // 關鍵修復：確保窗口成為前景窗口
     SetForegroundWindow(hwnd);
+    // 讓系統完成前景切換與重繪，避免選單初次顯示白屏
+    MSG msg;
+    for (int i = 0; i < 15; ++i) {
+        if (!PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) break;
+        if (msg.message == WM_QUIT) break;
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
     
-    // 使用TrackPopupMenuEx來更好地控制選單位置和顯示
+    // 使用TrackPopupMenuEx（TPM_NOANIMATION 避免動畫導致初次不繪製）
     TPMPARAMS tpmParams = {0};
     tpmParams.cbSize = sizeof(TPMPARAMS);
     tpmParams.rcExclude.left = pt.x - 1;
@@ -128,9 +136,8 @@ void showTrayMenu(HWND hwnd, GlobalState& state) {
     tpmParams.rcExclude.right = pt.x + 1;
     tpmParams.rcExclude.bottom = pt.y + 1;
     
-    // 顯示選單並等待用戶選擇
     int cmd = TrackPopupMenuEx(hMenu, 
-                            TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_VERTICAL,
+                            TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_VERTICAL | TPM_NOANIMATION,
                             pt.x, pt.y, hwnd, &tpmParams);
     
     // 清除選單顯示標誌

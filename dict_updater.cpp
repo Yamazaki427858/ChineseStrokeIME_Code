@@ -207,14 +207,14 @@ cleanup:
 }
 
 
-// 安全更新字典
+// 安全更新字典（localFile 為完整路徑，若為空則使用預設檔名於當前目錄）
 DownloadResult updateDictionarySafely(const char* downloadUrl, const char* localFile) {
     DownloadResult result;
     
     std::string dictFile = localFile ? localFile : LOCAL_DICT_FILE;
-    std::string tempFile = TEMP_DICT_FILE;
+    std::string tempFile = dictFile + ".tmp";
     
-    // 下载到临时文件
+    // 下载到临时文件（與目標同目錄）
     result = downloadFromGitHub(downloadUrl, tempFile.c_str());
     
     if (result.status != DownloadStatus::Success) {
@@ -312,8 +312,9 @@ std::wstring getStatusMessage(const DownloadResult& result) {
 }
 
 // 保存版本检查缓存
-void saveVersionCache(const std::string& version, time_t checkTime) {
-    std::ofstream outFile(VERSION_CACHE_FILE);
+void saveVersionCache(const std::string& version, time_t checkTime, const char* cachePath) {
+    const char* path = (cachePath && cachePath[0]) ? cachePath : VERSION_CACHE_FILE;
+    std::ofstream outFile(path);
     if (!outFile.is_open()) return;
     
     outFile << version << "|" << checkTime;
@@ -321,8 +322,9 @@ void saveVersionCache(const std::string& version, time_t checkTime) {
 }
 
 // 加载版本检查缓存
-std::string loadVersionCache(time_t& checkTime, int cacheHours) {
-    std::ifstream inFile(VERSION_CACHE_FILE);
+std::string loadVersionCache(time_t& checkTime, int cacheHours, const char* cachePath) {
+    const char* path = (cachePath && cachePath[0]) ? cachePath : VERSION_CACHE_FILE;
+    std::ifstream inFile(path);
     if (!inFile.is_open()) return "";
     
     std::string line;
@@ -358,11 +360,11 @@ std::string loadVersionCache(time_t& checkTime, int cacheHours) {
 }
 
 // 获取远程版本号（从 Update.md，带缓存机制）
-std::string getRemoteVersion(const char* updateUrl, bool forceCheck, int cacheHours) {
+std::string getRemoteVersion(const char* updateUrl, bool forceCheck, int cacheHours, const char* versionCachePath) {
     // 如果不强制检查，先尝试从缓存加载
     if (!forceCheck) {
         time_t cachedTime = 0;
-        std::string cachedVersion = loadVersionCache(cachedTime, cacheHours);
+        std::string cachedVersion = loadVersionCache(cachedTime, cacheHours, versionCachePath);
         if (!cachedVersion.empty()) {
             return cachedVersion;  // 使用缓存
         }
@@ -473,7 +475,7 @@ std::string getRemoteVersion(const char* updateUrl, bool forceCheck, int cacheHo
         
         // 如果成功获取版本号，保存到缓存
         if (!version.empty()) {
-            saveVersionCache(version, time(nullptr));
+            saveVersionCache(version, time(nullptr), versionCachePath);
         }
     } catch (...) {}
     

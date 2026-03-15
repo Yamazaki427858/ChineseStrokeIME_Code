@@ -38,6 +38,22 @@ std::wstring filterValidChars(const std::wstring& input) {
     return filtered;
 }
 
+// 將 u i o j k 轉為筆劃符號一丨丿丶フ，* 不轉換
+static std::wstring convertToStrokeSymbols(const std::wstring& input) {
+    std::wstring result;
+    for (wchar_t ch : input) {
+        switch (ch) {
+            case L'u': result += L'一'; break;
+            case L'i': result += L'丨'; break;
+            case L'o': result += L'丿'; break;
+            case L'j': result += L'丶'; break;
+            case L'k': result += L'フ'; break;
+            default:   result += ch;    break;
+        }
+    }
+    return result;
+}
+
 // 新增：獲取輸入顯示內容（包含3+3提示）
 std::wstring getInputDisplay(const GlobalState& state) {
     std::wstring display = state.input;
@@ -46,17 +62,21 @@ std::wstring getInputDisplay(const GlobalState& state) {
         display = L"標點符號選單";
     } else if (!state.input.empty()) {
         std::wstring filtered = filterValidChars(state.input);
+        std::wstring displayable = state.showStrokeSymbols ? convertToStrokeSymbols(filtered) : filtered;
+        display = displayable;
         
         // 如果原輸入包含無效字符，顯示過濾結果
         if (filtered != state.input) {
-            display += L" [已過濾: " + filtered + L"]";
+            display += L" [已過濾: " + displayable + L"]";
         }
         
         // 3+3模式提示（第七個字碼開始提示）
         if (filtered.length() >= 7) {
             std::wstring first3 = filtered.substr(0, 3);
             std::wstring last3 = filtered.substr(filtered.length() - 3);
-            display += L" (建議: " + first3 + L"*" + last3 + L")";
+            std::wstring dFirst3 = state.showStrokeSymbols ? convertToStrokeSymbols(first3) : first3;
+            std::wstring dLast3 = state.showStrokeSymbols ? convertToStrokeSymbols(last3) : last3;
+            display += L" (建議: " + dFirst3 + L"*" + dLast3 + L")";
         } else if (filtered.length() > 6) {
             display += L" (可用*號導出)";
         } else if (filtered.length() > 3) {
@@ -86,10 +106,26 @@ double getWordScore(const GlobalState& state, const std::wstring& word, const st
         double permanentBonus = info.isPermanent ? 5.0 : 0.0;
         score += (freqScore * timeWeight) + permanentBonus;
     }
+    // 智能聯想引擎：支援新的 contextLearning 結構
     if (!state.lastSelected.empty() && state.contextLearning.find(state.lastSelected) != state.contextLearning.end()) {
         const auto& context = state.contextLearning.at(state.lastSelected);
-        if (std::find(context.begin(), context.end(), word) != context.end()) {
-            score += 3.0;
+        if (context.find(word) != context.end()) {
+            std::pair<std::wstring, std::wstring> keyPair(state.lastSelected, word);
+            int count = context.at(word);
+            
+            // locked → score = ∞（使用非常大的數值）
+            if (state.lockedContext.find(keyPair) != state.lockedContext.end()) {
+                score += 1000000.0;  // 永遠置頂
+            }
+            // pinned → 置頂+加分，分數須恆高於自動學習（自動學習最高約 count*3+20）
+            else if (state.pinnedContext.find(keyPair) != state.pinnedContext.end()) {
+                score += 10000.0 + count;  // 確保高於任何自動學習分數
+            }
+            // 自動學習 → score = count * 3.0 + baseBonus
+            else {
+                const double baseBonus = 20.0;
+                score += count * 3.0 + baseBonus;
+            }
         }
     }
     return score;
@@ -100,6 +136,7 @@ void learnWord(GlobalState& state, const std::wstring& word) {
     if (word.empty()) return;
     
     time_t now = time(nullptr);
+    // 更新用戶詞庫（user_dict）
     if (state.wordFreq.find(word) == state.wordFreq.end()) {
         state.wordFreq[word] = {1, now, 1, false};
         Utils::updateStatus(state, L"學習新詞：" + word + L"（暫存）");
@@ -118,18 +155,35 @@ void learnWord(GlobalState& state, const std::wstring& word) {
         }
     }
     
-    if (!state.lastSelected.empty() && state.lastSelected != word) {
-        state.contextLearning[state.lastSelected].push_back(word);
-        if (state.contextLearning[state.lastSelected].size() > 10) {
-            state.contextLearning[state.lastSelected].erase(state.contextLearning[state.lastSelected].begin());
-        }
+    // 智能聯想引擎：更新 contextLearning（支援多字詞與片語）
+    const std::wstring prevWord = state.lastSelected;  // 上一個選字（單字或詞）
+    const std::wstring prevBigram = state.lastBigram;  // 上一個片語（例如「電腦」）
+    
+    if (!prevWord.empty() && prevWord != word) {
+        // 單字/詞 → 下一個字/詞
+        state.contextLearning[prevWord][word]++;
     }
+    if (!prevBigram.empty() && prevBigram != word) {
+        // 片語 → 下一個字/詞，例如「電腦」→「系」
+        state.contextLearning[prevBigram][word]++;
+    }
+    
+    // 更新 lastBigram：由前一個選字與本次選字組成片語
+    if (!prevWord.empty()) {
+        state.lastBigram = prevWord + word;
+    } else {
+        state.lastBigram.clear();
+    }
+    
+    // 更新最後選字
     state.lastSelected = word;
 }
 
-void loadMainDict(const char* filename, GlobalState& state) {
+void loadMainDict(GlobalState& state) {
     state.dict.clear();
-    std::ifstream fin(filename);
+    std::wstring dictPath = state.systemDir + L"Zi-Ma-Biao.txt";
+    std::string dictPathNarrow = Utils::wstrToUtf8(dictPath);
+    std::ifstream fin(dictPathNarrow);
     if (!fin.is_open()) {
         // 文件不存在，尝试从GitHub自动下载
         Utils::updateStatus(state, L"字碼表檔案不存在，嘗試從GitHub下載...");
@@ -137,13 +191,11 @@ void loadMainDict(const char* filename, GlobalState& state) {
             InvalidateRect(state.hWnd, nullptr, TRUE);
             UpdateWindow(state.hWnd);
         }
-        
-        DictUpdater::DownloadResult result = DictUpdater::updateDictionarySafely();
+        DictUpdater::DownloadResult result = DictUpdater::updateDictionarySafely(nullptr, dictPathNarrow.c_str());
         
         if (result.status == DictUpdater::DownloadStatus::Success) {
-            // 下载成功，重新尝试加载
             fin.close();
-            fin.open(filename);
+            fin.open(dictPathNarrow);
             if (fin.is_open()) {
                 Utils::updateStatus(state, L"✓ 成功從GitHub下載字碼表，正在載入...");
                 if (state.hWnd) {
@@ -184,7 +236,7 @@ void loadMainDict(const char* filename, GlobalState& state) {
                 msgBoxText += L"建議：\n";
                 msgBoxText += L"1. 檢查網路連接\n";
                 msgBoxText += L"2. 手動從GitHub下載 Zi-Ma-Biao.txt\n";
-                msgBoxText += L"3. 將文件放在程序目錄下\n\n";
+                msgBoxText += L"3. 將文件放在 system 目錄下\n\n";
                 msgBoxText += L"GitHub地址：\n";
                 msgBoxText += L"https://github.com/Yamazaki427858/ChineseStrokeIME";
                 
@@ -219,7 +271,19 @@ void loadMainDict(const char* filename, GlobalState& state) {
     }
     fin.close();
     state.dictSize = count;
-    Utils::updateStatus(state, L"重新載入中文字典：" + std::to_wstring(count) + L" 個字");
+    
+    // 建立 bigramIndex（相鄰字對索引）
+    state.bigramIndex.clear();
+    for (const auto& entry : state.dict) {
+        for (const auto& word : entry.second) {
+            // 掃描所有長度 ≥ 2 的詞條，建立相鄰字對索引
+            for (size_t i = 0; i + 1 < word.size(); i++) {
+                state.bigramIndex[word[i]][word[i+1]]++;
+            }
+        }
+    }
+    
+    Utils::updateStatus(state, L"重新載入中文字典：" + std::to_wstring(count) + L" 個字，已建立相鄰字對索引");
 }
 
 void loadPunctuator(GlobalState& state) {
@@ -262,12 +326,14 @@ void loadPunctuator(GlobalState& state) {
 
 void loadPunctMenu(GlobalState& state) {
     state.punctCandidates.clear();
+    bool fileDidNotExist = true;
     
-    // 首先嘗試載入檔案
-    std::ifstream fin("punct_menu.txt", std::ios::in | std::ios::binary);
+    std::wstring menuPath = state.userDir + L"punctmenu.txt";
+    std::ifstream fin(Utils::wstrToUtf8(menuPath), std::ios::in | std::ios::binary);
     if (!fin.is_open()) {
-        Utils::updateStatus(state, L"無法開啟 punct_menu.txt，使用內建標點選單");
+        Utils::updateStatus(state, L"無法開啟 punctmenu.txt，使用內建標點選單");
     } else {
+        fileDidNotExist = false;
         std::string content((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
         fin.close();
         
@@ -339,12 +405,23 @@ void loadPunctMenu(GlobalState& state) {
         L"♠", L"♥", L"♣", L"♦"
     };
     
+    // 僅在檔案不存在時建立預設 punctmenu.txt（user/ 永不覆蓋既有檔案）
+    if (fileDidNotExist) {
+        std::ofstream fout(Utils::wstrToUtf8(state.userDir + L"punctmenu.txt"), std::ios::out | std::ios::binary);
+        if (fout.is_open()) {
+            for (const auto& punct : state.punctCandidates) {
+                fout << Utils::wstrToUtf8(punct) << "\n";
+            }
+            fout.close();
+        }
+    }
+    
     Utils::updateStatus(state, L"使用內建標點符號選單：" + std::to_wstring(state.punctCandidates.size()) + L" 個符號");
 }
 
 void loadUserDict(GlobalState& state) {
     state.wordFreq.clear();
-    std::ifstream fin("user_dict.txt");
+    std::ifstream fin(Utils::wstrToUtf8(state.userDir + L"user_dict.txt"));
     if (!fin.is_open()) {
         Utils::updateStatus(state, L"首次使用，將建立用戶字典");
         return;
@@ -378,7 +455,7 @@ void loadUserDict(GlobalState& state) {
 
 void saveUserDict(const GlobalState& state) {
     try {
-        std::ofstream fout("user_dict.txt");
+        std::ofstream fout(Utils::wstrToUtf8(state.userDir + L"user_dict.txt"));
         if (!fout.is_open()) return;
         fout << "# 用戶字典 - 自動生成（已過濾標點符號）" << std::endl;
         fout << "# 格式：詞語<TAB><TAB>使用頻率<TAB>狀態" << std::endl;
@@ -404,6 +481,252 @@ void saveUserDict(const GlobalState& state) {
         }
         fout.close();
     } catch (...) {}
+}
+
+// 載入智能聯想引擎的個人上下文學習記錄
+void loadContextLearning(GlobalState& state) {
+    state.contextLearning.clear();
+    state.lockedContext.clear();
+    state.pinnedContext.clear();
+    state.blockedContext.clear();
+    
+    std::ifstream fin(Utils::wstrToUtf8(state.userDir + L"context_learning.txt"), std::ios::in | std::ios::binary);
+    if (!fin.is_open()) {
+        Utils::updateStatus(state, L"首次使用，將建立個人聯想記錄");
+        return;
+    }
+    
+    std::string content((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
+    fin.close();
+    
+    // 處理 UTF-8 BOM
+    if (content.length() >= 3 && 
+        content[0] == static_cast<char>(0xEF) &&
+        content[1] == static_cast<char>(0xBB) &&
+        content[2] == static_cast<char>(0xBF)) {
+        content = content.substr(3);
+    }
+    
+    std::stringstream ss(content);
+    std::string line;
+    int entryCount = 0;
+    
+    while (std::getline(ss, line)) {
+        // 移除行尾的 \r（Windows 換行符）
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        
+        // 移除前後空格
+        line.erase(0, line.find_first_not_of(" \t"));
+        line.erase(line.find_last_not_of(" \t") + 1);
+        
+        // 跳過空行和註解行
+        if (line.empty() || line[0] == '#') continue;
+        
+        // 解析格式：支援兩種
+        // 四欄：前字[TAB]後字[TAB]次數[TAB]模式
+        // 三欄：前字[TAB]後字[TAB]次數  或  前字[TAB]後字[TAB]模式（無次數時模式即第三欄）
+        std::vector<std::string> parts;
+        std::stringstream lineStream(line);
+        std::string part;
+        while (std::getline(lineStream, part, '\t')) {
+            parts.push_back(part);
+        }
+        
+        if (parts.size() >= 2) {
+            std::string p0 = parts[0], p1 = parts[1];
+            p0.erase(0, p0.find_first_not_of(" \t")); if (!p0.empty()) p0.erase(p0.find_last_not_of(" \t") + 1);
+            p1.erase(0, p1.find_first_not_of(" \t")); if (!p1.empty()) p1.erase(p1.find_last_not_of(" \t") + 1);
+            std::wstring prevWord = Utils::utf8ToWstr(p0);
+            std::wstring nextWord = Utils::utf8ToWstr(p1);
+            int useCount = 1;
+            std::string mode;
+            if (parts.size() >= 4) {
+                if (!parts[2].empty()) {
+                    try {
+                        useCount = std::stoi(parts[2]);
+                        if (useCount < 1) useCount = 1;
+                    } catch (...) {
+                        useCount = 1;
+                    }
+                }
+                mode = parts[3];
+            } else if (parts.size() == 3 && !parts[2].empty()) {
+                std::string third = parts[2];
+                third.erase(0, third.find_first_not_of(" \t"));
+                if (!third.empty()) third.erase(third.find_last_not_of(" \t") + 1);
+                if (third == "locked" || third == "pinned") {
+                    mode = third;
+                    useCount = 1;
+                } else {
+                    try {
+                        useCount = std::stoi(parts[2]);
+                        if (useCount < 1) useCount = 1;
+                    } catch (...) {
+                        useCount = 1;
+                    }
+                }
+            }
+            mode.erase(0, mode.find_first_not_of(" \t"));
+            if (!mode.empty()) mode.erase(mode.find_last_not_of(" \t") + 1);
+            
+            if (!prevWord.empty() && !nextWord.empty()) {
+                std::pair<std::wstring, std::wstring> keyPair(prevWord, nextWord);
+                if (mode == "blocked") {
+                    // 屏蔽條目：不加入 contextLearning，只記錄到 blockedContext
+                    state.blockedContext.insert(keyPair);
+                } else {
+                    auto& cnt = state.contextLearning[prevWord][nextWord];
+                    if (useCount > cnt) cnt = useCount;
+                    
+                    if (mode == "locked") {
+                        state.lockedContext.insert(keyPair);
+                        state.pinnedContext.erase(keyPair);  // 同一條目只能為 locked 或 pinned 其一
+                    } else if (mode == "pinned") {
+                        state.pinnedContext.insert(keyPair);
+                        state.lockedContext.erase(keyPair);
+                    }
+                }
+                entryCount++;
+            }
+        }
+    }
+    
+    if (entryCount > 0) {
+        Utils::updateStatus(state, L"載入個人聯想記錄：" + std::to_wstring(entryCount) + L" 個條目");
+    }
+}
+
+// 儲存智能聯想引擎的個人上下文學習記錄
+// 重要：直接以記憶體中的 contextLearning / lockedContext / pinnedContext / blockedContext 為準，
+// 不再重讀舊檔案，以避免覆蓋剛剛對 pinned/locked/blocked 所做的修改。
+void saveContextLearning(GlobalState& state) {
+    try {
+        std::string pathNarrow = Utils::wstrToUtf8(state.userDir + L"context_learning.txt");
+        std::ofstream fout(pathNarrow, std::ios::out | std::ios::binary);
+        if (!fout.is_open()) return;
+        
+        fout << static_cast<char>(0xEF) << static_cast<char>(0xBB) << static_cast<char>(0xBF);
+        fout << "# 個人聯想記錄 - 智能聯想引擎自動生成" << std::endl;
+        fout << "# 格式：前字[TAB]後字[TAB]次數[TAB]模式（三欄時可為 前[TAB]後[TAB]模式）" << std::endl;
+        fout << "# 模式：locked（永遠置頂）、pinned（置頂+加分）、無標記（自動學習）" << std::endl;
+        fout << "# 儲存順序：locked → pinned → 自動學習" << std::endl;
+        fout << std::endl;
+        
+        std::vector<std::tuple<std::wstring, std::wstring, int>> lockedEntries;
+        for (const auto& pair : state.lockedContext) {
+            const std::wstring& prevWord = pair.first;
+            const std::wstring& nextWord = pair.second;
+            if (state.contextLearning.find(prevWord) != state.contextLearning.end() &&
+                state.contextLearning.at(prevWord).find(nextWord) != state.contextLearning.at(prevWord).end()) {
+                int count = state.contextLearning.at(prevWord).at(nextWord);
+                lockedEntries.push_back(std::make_tuple(prevWord, nextWord, count));
+            }
+        }
+        std::sort(lockedEntries.begin(), lockedEntries.end(),
+            [](const std::tuple<std::wstring, std::wstring, int>& a,
+               const std::tuple<std::wstring, std::wstring, int>& b) {
+                return std::get<2>(a) > std::get<2>(b);
+            });
+        
+        for (const auto& entry : lockedEntries) {
+            fout << Utils::wstrToUtf8(std::get<0>(entry)) << "\t"
+                 << Utils::wstrToUtf8(std::get<1>(entry)) << "\t"
+                 << std::get<2>(entry) << "\tlocked" << std::endl;
+        }
+        
+        // 2. 再寫入所有 pinned 條目（按次數降序）
+        std::vector<std::tuple<std::wstring, std::wstring, int>> pinnedEntries;
+        for (const auto& pair : state.pinnedContext) {
+            const std::wstring& prevWord = pair.first;
+            const std::wstring& nextWord = pair.second;
+            if (state.contextLearning.find(prevWord) != state.contextLearning.end() &&
+                state.contextLearning.at(prevWord).find(nextWord) != state.contextLearning.at(prevWord).end()) {
+                int count = state.contextLearning.at(prevWord).at(nextWord);
+                pinnedEntries.push_back(std::make_tuple(prevWord, nextWord, count));
+            }
+        }
+        std::sort(pinnedEntries.begin(), pinnedEntries.end(),
+            [](const std::tuple<std::wstring, std::wstring, int>& a,
+               const std::tuple<std::wstring, std::wstring, int>& b) {
+                return std::get<2>(a) > std::get<2>(b);
+            });
+        
+        for (const auto& entry : pinnedEntries) {
+            fout << Utils::wstrToUtf8(std::get<0>(entry)) << "\t"
+                 << Utils::wstrToUtf8(std::get<1>(entry)) << "\t"
+                 << std::get<2>(entry) << "\tpinned" << std::endl;
+        }
+        
+        // 3. 最後寫入自動學習記錄（按次數降序，上限可設定）
+        std::vector<std::tuple<std::wstring, std::wstring, int>> autoEntries;
+        for (const auto& prevPair : state.contextLearning) {
+            for (const auto& nextPair : prevPair.second) {
+                std::pair<std::wstring, std::wstring> keyPair(prevPair.first, nextPair.first);
+                // 排除 locked 和 pinned 條目
+                if (state.lockedContext.find(keyPair) == state.lockedContext.end() &&
+                    state.pinnedContext.find(keyPair) == state.pinnedContext.end()) {
+                    // 過濾掉極小次數的雜訊紀錄（例如只出現 1 次）
+                    if (nextPair.second > state.contextLearningMinAutoCount) {
+                        autoEntries.push_back(std::make_tuple(prevPair.first, nextPair.first, nextPair.second));
+                    }
+                }
+            }
+        }
+        std::sort(autoEntries.begin(), autoEntries.end(),
+            [](const std::tuple<std::wstring, std::wstring, int>& a,
+               const std::tuple<std::wstring, std::wstring, int>& b) {
+                return std::get<2>(a) > std::get<2>(b);
+            });
+        
+        int maxAutoEntries = state.contextLearningMaxAutoEntries;
+        int autoCount = std::min(maxAutoEntries, (int)autoEntries.size());
+        for (int i = 0; i < autoCount; i++) {
+            const auto& entry = autoEntries[i];
+            fout << Utils::wstrToUtf8(std::get<0>(entry)) << "\t"
+                 << Utils::wstrToUtf8(std::get<1>(entry)) << "\t"
+                 << std::get<2>(entry) << std::endl;
+        }
+        
+        // 4. 寫入 blocked 條目（最後，避免影響正常排序）
+        for (const auto& pair : state.blockedContext) {
+            fout << Utils::wstrToUtf8(pair.first) << "\t"
+                 << Utils::wstrToUtf8(pair.second) << "\t0\tblocked" << std::endl;
+        }
+        
+        fout.close();
+    } catch (...) {}
+}
+
+void setContextLocked(GlobalState& state, const std::wstring& prevWord, const std::wstring& nextWord, bool locked) {
+    if (prevWord.empty() || nextWord.empty()) return;
+    std::pair<std::wstring, std::wstring> keyPair(prevWord, nextWord);
+    if (state.contextLearning.find(prevWord) == state.contextLearning.end() ||
+        state.contextLearning[prevWord].find(nextWord) == state.contextLearning[prevWord].end()) {
+        state.contextLearning[prevWord][nextWord] = 1;
+    }
+    if (locked) {
+        state.lockedContext.insert(keyPair);
+        state.pinnedContext.erase(keyPair);
+    } else {
+        state.lockedContext.erase(keyPair);
+    }
+}
+
+void setContextPinned(GlobalState& state, const std::wstring& prevWord, const std::wstring& nextWord, bool pinned) {
+    if (prevWord.empty() || nextWord.empty()) return;
+    std::pair<std::wstring, std::wstring> keyPair(prevWord, nextWord);
+    if (state.contextLearning.find(prevWord) == state.contextLearning.end() ||
+        state.contextLearning[prevWord].find(nextWord) == state.contextLearning[prevWord].end()) {
+        state.contextLearning[prevWord][nextWord] = 1;
+    }
+    if (pinned) {
+        state.pinnedContext.insert(keyPair);
+        state.lockedContext.erase(keyPair);
+    } else {
+        state.pinnedContext.erase(keyPair);
+    }
 }
 
 bool validateInput(const std::wstring& input) {
@@ -472,12 +795,19 @@ void updateCandidates(GlobalState& state) {
     state.selected = 0;
     state.currentPage = 0;
     state.inputError = false;
+    state.hoverCandidateIndex = -1;
+    // 進入字碼查字模式時，一律離開聯想模式
+    state.isPredictionMode = false;
+    state.hoverCandidateIndex = -1;
+    
+    // 顯示字碼候選字時，隱藏聯想字視窗（改由模式切換統一處理）
+    if (state.hPredWnd) ShowWindow(state.hPredWnd, SW_HIDE);
     
     if (state.input.empty()) { 
         state.showCand = false;
         state.isInputting = false;
-        if (state.hCandWnd) ShowWindow(state.hCandWnd, SW_HIDE);
-        if (state.hInputWnd) ShowWindow(state.hInputWnd, SW_HIDE);
+        // 重置為空閒模式並隱藏所有輸入相關視窗
+        WindowManager::switchMode(state, InputMode::IDLE);
         std::wstring modeText = state.chineseMode ? L"中文筆劃+全形" : L"英文直接+半形";
         Utils::updateStatus(state, modeText + L"模式" + (state.bufferMode ? L" [暫放模式]" : L""));
         // 修復：重繪工具列以即時更新狀態指示燈（使用 FALSE 只重繪無效區域，減少閃爍）
@@ -492,15 +822,16 @@ void updateCandidates(GlobalState& state) {
         // ★ 關鍵修改：保持輸入狀態，不設為false
         state.isInputting = true;  
         
-        // 保持字碼輸入視窗顯示
+        // 保持字碼輸入視窗顯示，候選/聯想均隱藏（視為暫時離開候選模式）
         if (state.hInputWnd) {
             ShowWindow(state.hInputWnd, SW_SHOW);
             InvalidateRect(state.hInputWnd, nullptr, TRUE);
         }
-        
-        // 隱藏候選字視窗但立即重新定位字碼視窗
         if (state.hCandWnd) {
             ShowWindow(state.hCandWnd, SW_HIDE);
+        }
+        if (state.hPredWnd) {
+            ShowWindow(state.hPredWnd, SW_HIDE);
         }
         
         // ★ 新增：強制重新定位字碼視窗
@@ -526,6 +857,9 @@ void updateCandidates(GlobalState& state) {
         
         if (state.hCandWnd) {
             ShowWindow(state.hCandWnd, SW_HIDE);
+        }
+        if (state.hPredWnd) {
+            ShowWindow(state.hPredWnd, SW_HIDE);
         }
         
         // ★ 新增：強制重新定位字碼視窗
@@ -602,10 +936,12 @@ void updateCandidates(GlobalState& state) {
     
     // ★ 修改：統一使用 WindowManager 來處理視窗定位
     if (state.showCand) {
-        // 有候選字時，定位候選字視窗和字碼視窗
+        // 有候選字時，進入候選模式並定位候選字視窗與字碼視窗
+        WindowManager::switchMode(state, InputMode::CAND_MODE);
         WindowManager::positionWindowsOptimized(state);
     } else {
-        // 沒有候選字時，只定位字碼視窗
+        // 沒有候選字時，只定位字碼視窗並維持非候選模式
+        WindowManager::switchMode(state, InputMode::IDLE);
         WindowManager::positionInputWindow(state);
         if (state.hCandWnd) ShowWindow(state.hCandWnd, SW_HIDE);
     }
@@ -648,23 +984,18 @@ void selectCandidate(GlobalState& state, int idx) {
     if (actualIndex < 0 || actualIndex >= (int)state.candidates.size()) return;
     std::wstring selected = state.candidates[actualIndex];
     
-    // 判斷是否為聯想字模式（候選字碼為"聯想"、"常用"或"詞語"）
+    // 判斷是否為聯想字模式（候選字碼為 ⚑⚐聯想／常用／詞語 皆繼續聯想）
     bool isPredictionMode = (actualIndex < (int)state.candidateCodes.size() && 
-                            (state.candidateCodes[actualIndex] == L"聯想" || 
+                            (state.candidateCodes[actualIndex] == L"⚑" ||
+                             state.candidateCodes[actualIndex] == L"⚐" ||
+                             state.candidateCodes[actualIndex] == L"聯想" || 
                              state.candidateCodes[actualIndex] == L"常用" ||
                              state.candidateCodes[actualIndex] == L"詞語"));
     
+    // 輸出文字
     if (state.bufferMode) {
         // 暫放模式下：所有選擇的文字（包括標點符號）都插入暫放區
         BufferManager::insertTextAtCursor(state, selected);
-        if (!state.showPunctMenu) {
-            learnWord(state, selected);
-            // 延遲保存用戶字典（使用定時器，避免頻繁寫入文件）
-            if (state.hWnd) {
-                KillTimer(state.hWnd, 995);  // 先清除舊的定時器（使用995避免衝突）
-                SetTimer(state.hWnd, 995, 2000, NULL);  // 2秒後保存
-            }
-        }
         if (state.showPunctMenu) {
             Utils::updateStatus(state, L"已加入標點符號：" + selected + L" (共" + std::to_wstring(state.bufferText.length()) + L"字)");
         } else {
@@ -673,13 +1004,16 @@ void selectCandidate(GlobalState& state, int idx) {
     } else {
         // 非暫放模式：直接發送到目標應用程式
         InputHandler::sendTextDirectUnicode(selected);
-        if (!state.showPunctMenu) {
-            learnWord(state, selected);
-            // 延遲保存用戶字典（使用定時器，避免頻繁寫入文件）
-            if (state.hWnd) {
-                KillTimer(state.hWnd, 995);  // 先清除舊的定時器（使用995避免衝突）
-                SetTimer(state.hWnd, 995, 2000, NULL);  // 2秒後保存
-            }
+    }
+    
+    // ✅ learnWord 必須在此處呼叫，不受 enableWordPrediction 影響
+    // 確保關閉聯想字時，contextLearning 和 lastSelected 仍然持續更新
+    if (!state.showPunctMenu) {
+        learnWord(state, selected);
+        // 延遲保存用戶字典（使用定時器，避免頻繁寫入文件）
+        if (state.hWnd) {
+            KillTimer(state.hWnd, 995);  // 先清除舊的定時器（使用995避免衝突）
+            SetTimer(state.hWnd, 995, 2000, NULL);  // 2秒後保存
         }
     }
     
@@ -692,8 +1026,8 @@ void selectCandidate(GlobalState& state, int idx) {
         state.isInputting = false;
         state.inputError = false;
         state.showPunctMenu = false;
-        if (state.hCandWnd) ShowWindow(state.hCandWnd, SW_HIDE);
-        if (state.hInputWnd) ShowWindow(state.hInputWnd, SW_HIDE);
+        // 標點選單完成後回到空閒模式
+        WindowManager::switchMode(state, InputMode::IDLE);
         IMEManager::restoreWindowsIME();
         // 修復：重繪工具列以即時更新狀態指示燈（使用 FALSE 只重繪無效區域，減少閃爍）
         if (state.hWnd) InvalidateRect(state.hWnd, nullptr, FALSE);
@@ -729,10 +1063,8 @@ void selectCandidate(GlobalState& state, int idx) {
     state.isInputting = false;
     state.inputError = false;
     state.showPunctMenu = false;
-
-    // 同時隱藏候選字視窗和字碼視窗
-    if (state.hCandWnd) ShowWindow(state.hCandWnd, SW_HIDE);
-    if (state.hInputWnd) ShowWindow(state.hInputWnd, SW_HIDE);
+    // 正常結束輸入：切換到空閒模式並關閉所有輸入相關視窗
+    WindowManager::switchMode(state, InputMode::IDLE);
     
     // 🔥 恢復 Windows 輸入法狀態（輸入完成後）
     IMEManager::restoreWindowsIME();
@@ -750,10 +1082,16 @@ void changePage(GlobalState& state, int direction) {
         state.currentPage--;
         state.selected = 0;
     }
-    Utils::updateStatus(state, L"第" + std::to_wstring(state.currentPage + 1) + L"/" + 
-                        std::to_wstring(state.totalPages) + L"頁 共" + 
-                        std::to_wstring(state.candidates.size()) + L"個候選字");
-    if (state.hCandWnd) InvalidateRect(state.hCandWnd, nullptr, TRUE);
+    // 翻頁優化：只更新狀態列文字，不觸發工具列重繪（頁碼已在候選/聯想視窗內顯示）
+    state.statusInfo = L"第" + std::to_wstring(state.currentPage + 1) + L"/" +
+                      std::to_wstring(state.totalPages) + L"頁 共" +
+                      std::to_wstring(state.candidates.size()) + L"個候選字";
+    // 只重繪目前顯示的列表視窗，並立即更新以減少遲緩感
+    HWND listWnd = (state.currentMode == InputMode::CAND_MODE) ? state.hCandWnd : state.hPredWnd;
+    if (listWnd) {
+        InvalidateRect(listWnd, nullptr, TRUE);
+        UpdateWindow(listWnd);
+    }
 }
 
 void autoApply3Plus3Mode(GlobalState& state) {
@@ -788,15 +1126,14 @@ bool updateDictFromGitHub(GlobalState& state, bool showProgress) {
         }
     }
     
-    // 直接下載，不使用 GitHub API 檢查（避免 API 訪問次數限制）
-    DictUpdater::DownloadResult downloadResult = DictUpdater::updateDictionarySafely();
+    std::string dictPathNarrow = Utils::wstrToUtf8(state.systemDir + L"Zi-Ma-Biao.txt");
+    DictUpdater::DownloadResult downloadResult = DictUpdater::updateDictionarySafely(nullptr, dictPathNarrow.c_str());
     
     if (downloadResult.status == DictUpdater::DownloadStatus::Success) {
-        // 下載成功，重新載入字典
-        std::ifstream testFile("Zi-Ma-Biao.txt");
+        std::ifstream testFile(dictPathNarrow);
         if (testFile.is_open()) {
             testFile.close();
-            loadMainDict("Zi-Ma-Biao.txt", state);
+            loadMainDict(state);
             Utils::updateStatus(state, L"✓ 字碼表已更新：" + 
                               std::to_wstring(downloadResult.fileSize) + L" 字節");
             if (state.hWnd) {
@@ -838,11 +1175,13 @@ bool updateDictFromGitHub(GlobalState& state, bool showProgress) {
 }
 
 // 載入詞語庫文件
-void loadWordPhrases(GlobalState& state, const char* filename) {
+void loadWordPhrases(GlobalState& state) {
     state.wordPhrases.clear();
     state.phraseDictSize = 0;
     
-    std::ifstream fin(filename, std::ios::in | std::ios::binary);
+    std::wstring path = state.systemDir + L"wordphrases.txt";
+    std::string pathNarrow = Utils::wstrToUtf8(path);
+    std::ifstream fin(pathNarrow, std::ios::in | std::ios::binary);
     if (!fin.is_open()) {
         // 文件不存在，嘗試從GitHub自動下載（靜默下載，不顯示提示）
         const char* downloadUrl = 
@@ -850,14 +1189,13 @@ void loadWordPhrases(GlobalState& state, const char* filename) {
         
         DictUpdater::DownloadResult downloadResult = DictUpdater::downloadFromGitHub(
             downloadUrl, 
-            filename,  // 直接下載到目標文件
+            pathNarrow.c_str(),
             30  // 30秒超時
         );
         
         if (downloadResult.status == DictUpdater::DownloadStatus::Success) {
-            // 下載成功，重新嘗試打開文件
             fin.close();
-            fin.open(filename, std::ios::in | std::ios::binary);
+            fin.open(pathNarrow, std::ios::in | std::ios::binary);
             if (!fin.is_open()) {
                 // 下載成功但無法打開文件（不應該發生）
                 return;
@@ -927,6 +1265,23 @@ void loadWordPhrases(GlobalState& state, const char* filename) {
                         count++;
                     }
                 }
+                // 支援至少兩字後續的聯想選擇：詞語長度≥3 時，將「首字→後續 2 字以上」加入候選
+                // 例如「高登仔」→ 高→「登仔」、「電腦系統」→ 電→「腦系統」
+                if (phrase.length() >= 3) {
+                    std::wstring firstChar = phrase.substr(0, 1);
+                    std::wstring continuation = phrase.substr(1);  // 長度 ≥ 2
+                    bool exists = false;
+                    if (state.wordPhrases.find(firstChar) != state.wordPhrases.end()) {
+                        const auto& existing = state.wordPhrases[firstChar];
+                        if (std::find(existing.begin(), existing.end(), continuation) != existing.end()) {
+                            exists = true;
+                        }
+                    }
+                    if (!exists) {
+                        state.wordPhrases[firstChar].push_back(continuation);
+                        count++;
+                    }
+                }
             }
         } catch (...) {
             // 轉換失敗，跳過這行
@@ -940,160 +1295,214 @@ void loadWordPhrases(GlobalState& state, const char* filename) {
     }
 }
 
-// 獲取聯想字候選列表
+// 獲取聯想字候選列表（智能聯想引擎優化版）
 void getWordPredictions(GlobalState& state, const std::wstring& word) {
     state.candidates.clear();
     state.candidateCodes.clear();
     
     if (word.empty()) return;
     
-    // 0. 從詞語庫中獲取聯想字（最高優先級，如果詞語庫存在）
-    if (state.phraseDictSize > 0 && state.wordPhrases.find(word) != state.wordPhrases.end()) {
-        const auto& phrases = state.wordPhrases.at(word);
-        for (const auto& phraseChar : phrases) {
-            if (std::find(state.candidates.begin(), state.candidates.end(), phraseChar) == state.candidates.end()) {
-                state.candidates.push_back(phraseChar);
-                // 查找該字的字碼
-                std::wstring code = L"";
-                for (const auto& pair : state.dict) {
-                    if (std::find(pair.second.begin(), pair.second.end(), phraseChar) != pair.second.end()) {
-                        code = pair.first;
-                        break;
+    // 多字詞時：個人聯想用完整前文 word，詞語庫/共現表用最後一字查詢
+    const std::wstring wordKey = (word.length() > 1) ? word.substr(word.length() - 1, 1) : word;
+    
+    // 候選字及其分數（使用 map 自動去重並合併分數）
+    // key: 候選字/詞, value: 分數
+    std::map<std::wstring, double> candidateScores;
+    std::unordered_set<std::wstring> seenCandidates;  // 用於快速去重檢查
+    
+    // 輔助函數：查找字碼（支援單字和多字詞）
+    auto findCode = [&state](const std::wstring& w) -> std::wstring {
+        // 如果是單字，直接查找
+        if (w.length() == 1) {
+            for (const auto& pair : state.dict) {
+                for (const auto& dictWord : pair.second) {
+                    if (dictWord == w) {
+                        return pair.first;
                     }
                 }
-                state.candidateCodes.push_back(code.empty() ? L"詞語" : code);
+            }
+        } else {
+            // 如果是多字詞，查找第一個字的字碼
+            std::wstring firstChar = w.substr(0, 1);
+            for (const auto& pair : state.dict) {
+                for (const auto& dictWord : pair.second) {
+                    if (dictWord == firstChar) {
+                        return pair.first;
+                    }
+                }
             }
         }
-    }
+        return L"";
+    };
     
-    // 1. 從上下文學習中獲取聯想字（優先級次高）
+    // ========== 來源一：contextLearning（個人上下文，優先級最高） ==========
     if (state.contextLearning.find(word) != state.contextLearning.end()) {
-        const auto& contextWords = state.contextLearning.at(word);
-        for (const auto& contextWord : contextWords) {
-            if (std::find(state.candidates.begin(), state.candidates.end(), contextWord) == state.candidates.end()) {
-                state.candidates.push_back(contextWord);
-                // 查找該字的字碼（如果有的話）
-                std::wstring code = L"";
-                for (const auto& pair : state.dict) {
-                    if (std::find(pair.second.begin(), pair.second.end(), contextWord) != pair.second.end()) {
-                        code = pair.first;
-                        break;
-                    }
-                }
-                state.candidateCodes.push_back(code.empty() ? L"聯想" : code);
+        const auto& contextMap = state.contextLearning.at(word);
+        for (const auto& pair : contextMap) {
+            const std::wstring& nextWord = pair.first;
+            int count = pair.second;
+            std::pair<std::wstring, std::wstring> keyPair(word, nextWord);
+            
+            // blocked 條目：無論來源如何都直接略過
+            if (state.blockedContext.find(keyPair) != state.blockedContext.end()) {
+                continue;
+            }
+            
+            double score = 0.0;
+            // locked → score = ∞（使用非常大的數值）
+            if (state.lockedContext.find(keyPair) != state.lockedContext.end()) {
+                score = 1000000.0;  // 永遠置頂
+            }
+            // pinned → 置頂+加分，分數須恆高於自動學習
+            else if (state.pinnedContext.find(keyPair) != state.pinnedContext.end()) {
+                score = 10000.0 + count;  // 確保高於任何自動學習分數
+            }
+            // 自動學習 → score = count * 3.0 + baseBonus
+            else {
+                const double baseBonus = 20.0;
+                score = count * 3.0 + baseBonus;
+            }
+            
+            // 去重規則：合併分數（取最大值）
+            if (candidateScores.find(nextWord) == candidateScores.end()) {
+                candidateScores[nextWord] = score;
+                seenCandidates.insert(nextWord);
+            } else {
+                candidateScores[nextWord] = std::max(candidateScores[nextWord], score);
             }
         }
     }
     
-    // 2. 從字典中查找常見的詞語組合（優化版：支持2字詞和3字詞）
-    // 查找以該字開頭的常見詞語
-    std::map<std::wstring, int> wordScores;  // 字 -> 分數
-    
-    for (const auto& pair : state.dict) {
-        for (const auto& dictWord : pair.second) {
-            // 如果字典中的字以選中的字開頭（形成詞語）
-            if (dictWord.length() > 1 && dictWord[0] == word[0]) {
-                // 提取後續字（支持2字詞和3字詞）
-                for (size_t i = 1; i < dictWord.length() && i <= 2; i++) {
-                    std::wstring nextChar = dictWord.substr(i, 1);
-                    if (nextChar.length() == 1) {
-                        // 計算分數（基於詞頻和詞語長度）
-                        int score = 0;
-                        if (state.wordFreq.find(dictWord) != state.wordFreq.end()) {
-                            score = state.wordFreq.at(dictWord).frequency * 2;  // 詞語頻率加權
-                        } else {
-                            score = 1;  // 基礎分數
-                        }
-                        // 2字詞優先於3字詞
-                        if (dictWord.length() == 2) {
-                            score += 5;
-                        }
-                        if (wordScores.find(nextChar) == wordScores.end() || wordScores[nextChar] < score) {
-                            wordScores[nextChar] = score;
-                        }
-                    }
-                }
+    // ========== 來源二：bigramIndex + wordPhrases（詞語庫，補充通用詞） ==========
+    // 2.1 從 bigramIndex 查詢（O(1) 查表，多字前文時用最後一字）
+    if (!wordKey.empty() && state.bigramIndex.find(wordKey[0]) != state.bigramIndex.end()) {
+        const auto& bigramMap = state.bigramIndex.at(wordKey[0]);
+        for (const auto& pair : bigramMap) {
+            wchar_t nextChar = pair.first;
+            int cooccurCount = pair.second;
+            std::wstring nextWord(1, nextChar);
+            std::pair<std::wstring, std::wstring> keyPair(word, nextWord);
+            
+            // blocked 條目：無論來源如何都直接略過
+            if (state.blockedContext.find(keyPair) != state.blockedContext.end()) {
+                continue;
             }
-            // 如果字典中的字以選中的字結尾（形成詞語）
-            if (dictWord.length() > 1 && dictWord.back() == word[0]) {
-                // 提取前面的字（支持2字詞和3字詞）
-                for (size_t i = 0; i < dictWord.length() - 1 && i < 2; i++) {
-                    std::wstring prevChar = dictWord.substr(i, 1);
-                    if (prevChar.length() == 1) {
-                        int score = 0;
-                        if (state.wordFreq.find(dictWord) != state.wordFreq.end()) {
-                            score = state.wordFreq.at(dictWord).frequency * 2;  // 詞語頻率加權
-                        } else {
-                            score = 1;  // 基礎分數
-                        }
-                        // 2字詞優先於3字詞
-                        if (dictWord.length() == 2) {
-                            score += 5;
-                        }
-                        if (wordScores.find(prevChar) == wordScores.end() || wordScores[prevChar] < score) {
-                            wordScores[prevChar] = score;
-                        }
-                    }
-                }
+            
+            // 靜態共現權重（低於個人學習分數）
+            double score = cooccurCount * 0.5;  // 降低權重，避免覆蓋個人學習
+            
+            if (seenCandidates.find(nextWord) == seenCandidates.end()) {
+                candidateScores[nextWord] = score;
+                seenCandidates.insert(nextWord);
+            } else {
+                candidateScores[nextWord] = std::max(candidateScores[nextWord], score);
             }
         }
     }
     
-    // 按分數排序並添加到候選列表
-    std::vector<std::pair<std::wstring, int>> sortedWords;
-    for (const auto& pair : wordScores) {
-        if (std::find(state.candidates.begin(), state.candidates.end(), pair.first) == state.candidates.end()) {
-            sortedWords.push_back(std::make_pair(pair.first, pair.second));
+    // 2.2 從 wordPhrases 查詢詞語庫（多字前文時用最後一字）
+    if (state.phraseDictSize > 0 && state.wordPhrases.find(wordKey) != state.wordPhrases.end()) {
+        const auto& phrases = state.wordPhrases.at(wordKey);
+        for (const auto& phraseChar : phrases) {
+            std::pair<std::wstring, std::wstring> keyPair(word, phraseChar);
+            if (state.blockedContext.find(keyPair) != state.blockedContext.end()) {
+                continue;
+            }
+            // 靜態共現權重（低於個人學習分數）
+            double score = 5.0;  // 詞語庫基礎分數
+            
+            if (seenCandidates.find(phraseChar) == seenCandidates.end()) {
+                candidateScores[phraseChar] = score;
+                seenCandidates.insert(phraseChar);
+            } else {
+                candidateScores[phraseChar] = std::max(candidateScores[phraseChar], score);
+            }
         }
     }
-    std::sort(sortedWords.begin(), sortedWords.end(), 
-        [](const std::pair<std::wstring, int>& a, const std::pair<std::wstring, int>& b) {
+    
+    // ========== 來源三：wordFreq（兜底，確保候選字不為空） ==========
+    if (candidateScores.size() < 5) {
+        // 從 wordFreq 補入高頻單字
+        std::vector<std::pair<std::wstring, int>> freqWords;
+        for (const auto& pair : state.wordFreq) {
+            // 只考慮單字，且未被加入候選列表
+            if (pair.first.length() == 1 && seenCandidates.find(pair.first) == seenCandidates.end()) {
+                std::pair<std::wstring, std::wstring> keyPair(word, pair.first);
+                if (state.blockedContext.find(keyPair) != state.blockedContext.end()) {
+                    continue;
+                }
+                freqWords.push_back(std::make_pair(pair.first, pair.second.frequency));
+            }
+        }
+        std::sort(freqWords.begin(), freqWords.end(),
+            [](const std::pair<std::wstring, int>& a, const std::pair<std::wstring, int>& b) {
+                return a.second > b.second;
+            });
+        
+        // 補入最多 5 個高頻字
+        int maxSupplement = 5 - (int)candidateScores.size();
+        for (int i = 0; i < maxSupplement && i < (int)freqWords.size(); i++) {
+            const std::wstring& freqWord = freqWords[i].first;
+            double score = freqWords[i].second * 0.1;  // 兜底分數較低
+            candidateScores[freqWord] = score;
+            seenCandidates.insert(freqWord);
+        }
+    }
+    
+    // ========== 按分數排序並生成候選列表 ==========
+    std::vector<std::pair<std::wstring, double>> sortedCandidates;
+    for (const auto& pair : candidateScores) {
+        sortedCandidates.push_back(std::make_pair(pair.first, pair.second));
+    }
+    
+    // 優先顯示 context_learning.txt（個人聯想）的候選：來自個人聯想的排在最前，其餘按分數
+    std::unordered_set<std::wstring> fromContextLearning;
+    if (state.contextLearning.find(word) != state.contextLearning.end()) {
+        for (const auto& p : state.contextLearning.at(word)) {
+            fromContextLearning.insert(p.first);
+        }
+    }
+    std::sort(sortedCandidates.begin(), sortedCandidates.end(),
+        [&fromContextLearning](const std::pair<std::wstring, double>& a, const std::pair<std::wstring, double>& b) {
+            bool aFrom = (fromContextLearning.find(a.first) != fromContextLearning.end());
+            bool bFrom = (fromContextLearning.find(b.first) != fromContextLearning.end());
+            if (aFrom && !bFrom) return true;
+            if (!aFrom && bFrom) return false;
             return a.second > b.second;
         });
     
     // 限制聯想字數量（最多20個）
     size_t maxPredictions = 20;
-    for (size_t i = 0; i < sortedWords.size() && state.candidates.size() < maxPredictions; i++) {
-        state.candidates.push_back(sortedWords[i].first);
-        // 查找該字的字碼
-        std::wstring code = L"";
-        for (const auto& pair : state.dict) {
-            if (std::find(pair.second.begin(), pair.second.end(), sortedWords[i].first) != pair.second.end()) {
-                code = pair.first;
-                break;
-            }
-        }
-        state.candidateCodes.push_back(code.empty() ? L"聯想" : code);
-    }
-    
-    // 3. 如果候選字太少，從字典中隨機選擇一些常見字
-    if (state.candidates.size() < 5) {
-        // 選擇詞頻較高的字作為補充
-        std::vector<std::pair<std::wstring, int>> freqWords;
-        for (const auto& pair : state.wordFreq) {
-            if (pair.first.length() == 1 && 
-                std::find(state.candidates.begin(), state.candidates.end(), pair.first) == state.candidates.end()) {
-                freqWords.push_back(std::make_pair(pair.first, pair.second.frequency));
-            }
-        }
-        std::sort(freqWords.begin(), freqWords.end(), 
-            [](const std::pair<std::wstring, int>& a, const std::pair<std::wstring, int>& b) {
-                return a.second > b.second;
-            });
+    for (size_t i = 0; i < sortedCandidates.size() && i < maxPredictions; i++) {
+        const std::wstring& candidate = sortedCandidates[i].first;
+        state.candidates.push_back(candidate);
         
-        // maxPredictions 已在上面定義為 size_t，這裡直接使用
-        for (size_t i = 0; i < freqWords.size() && state.candidates.size() < maxPredictions; i++) {
-            state.candidates.push_back(freqWords[i].first);
-            // 查找該字的字碼
-            std::wstring code = L"";
-            for (const auto& pair : state.dict) {
-                if (std::find(pair.second.begin(), pair.second.end(), freqWords[i].first) != pair.second.end()) {
-                    code = pair.first;
-                    break;
-                }
+        // 聯想字清單優先顯示狀態符號（⚑/⚐/聯想/詞語/常用），否則才顯示筆劃字碼
+        double score = sortedCandidates[i].second;
+        std::wstring code;
+        if (score >= 1000000.0) {
+            code = L"⚑";   // locked 永遠置頂
+        } else if (score >= 10000.0) {
+            code = L"⚐";   // pinned 置頂+加分
+        } else if (state.contextLearning.find(word) != state.contextLearning.end() &&
+                   state.contextLearning.at(word).find(candidate) != state.contextLearning.at(word).end()) {
+            code = L"聯想";
+        } else if (state.wordPhrases.find(wordKey) != state.wordPhrases.end()) {
+            const auto& phrases = state.wordPhrases.at(wordKey);
+            if (std::find(phrases.begin(), phrases.end(), candidate) != phrases.end()) {
+                code = L"詞語";
+            } else {
+                code = L"常用";
             }
-            state.candidateCodes.push_back(code.empty() ? L"常用" : code);
+        } else {
+            code = L"常用";
         }
+        // 若無特殊標記且可查得筆劃字碼，則顯示字碼（僅在 showCandidateCode 時由視窗決定是否顯示）
+        if (code == L"常用") {
+            std::wstring strokeCode = findCode(candidate);
+            if (!strokeCode.empty()) code = strokeCode;
+        }
+        state.candidateCodes.push_back(code);
     }
 }
 
@@ -1103,77 +1512,33 @@ void showPredictionsAfterSelection(GlobalState& state, const std::wstring& selec
     if (selected.empty()) return;
     if (Utils::isPunctuation(selected)) return;  // 標點符號不觸發聯想
     
-    // 獲取聯想字
+    // 獲取聯想字（多字詞時 getWordPredictions 內部會以最後一字查詞語庫/共現，前文仍用完整詞供個人聯想）
     getWordPredictions(state, selected);
     
     if (state.candidates.empty()) {
-        // 沒有聯想字，正常結束輸入
-        state.showCand = false;
-        state.isInputting = false;
-        if (state.hCandWnd) ShowWindow(state.hCandWnd, SW_HIDE);
-        if (state.hInputWnd) ShowWindow(state.hInputWnd, SW_HIDE);
-        // 修復：重繪工具列以即時更新狀態指示燈（使用 FALSE 只重繪無效區域，減少閃爍）
-        if (state.hWnd) InvalidateRect(state.hWnd, nullptr, FALSE);
+        // 沒有聯想字：隱藏聯想字視窗即可（字碼候選由 updateCandidates 管理）
+        if (state.hPredWnd) ShowWindow(state.hPredWnd, SW_HIDE);
+        // 沒有聯想時回到一般候選或空閒狀態，由外層邏輯決定
+        state.isPredictionMode = false;
         return;
     }
     
-    // 有聯想字，顯示候選字視窗
+    // 有聯想字，顯示聯想視窗（hPredWnd）
     state.selected = 0;
     state.currentPage = 0;
     state.totalPages = (state.candidates.size() + CANDIDATES_PER_PAGE - 1) / CANDIDATES_PER_PAGE;
     state.showCand = true;
     state.isInputting = true;  // 保持輸入狀態，以便繼續選擇聯想字
+    state.isPredictionMode = true;
+    // 預設不啟用任何候選字的 hover，等滑鼠移入時再設定
+    state.hoverCandidateIndex = -1;
     
-    // 修復：總是重新定位視窗以確保視窗大小根據聯想字內容自動調整
-    // 聯想字的內容可能與之前的候選字不同，需要重新計算視窗大小
+    // 聯想字視窗定位與顯示：切換到聯想模式，由模式控制視窗顯示
+    WindowManager::switchMode(state, InputMode::PRED_MODE);
     WindowManager::positionWindowsOptimized(state);
-    
-    // 確保候選字視窗顯示並更新（優化：減少不必要的操作）
-    if (state.hCandWnd) {
-        if (!IsWindowVisible(state.hCandWnd)) {
-            ShowWindow(state.hCandWnd, SW_SHOW);
-        }
-        // 只更新內容，不強制立即重繪
-        InvalidateRect(state.hCandWnd, nullptr, FALSE);
+    if (state.hPredWnd) {
+        InvalidateRect(state.hPredWnd, nullptr, FALSE);
     }
-    
-    // 確保字碼視窗顯示並更新（優化：減少不必要的操作）
-    if (state.hInputWnd) {
-        if (!IsWindowVisible(state.hInputWnd)) {
-            ShowWindow(state.hInputWnd, SW_SHOW);
-        }
-        // 只更新內容，不強制立即重繪
-        InvalidateRect(state.hInputWnd, nullptr, FALSE);
-    }
-    
-    // 優化：移除頻繁的焦點切換，避免閃爍
-    // 只在視窗未顯示時才確保目標應用程式有焦點
-    bool needReposition = !IsWindowVisible(state.hCandWnd) || !IsWindowVisible(state.hInputWnd);
-    if (needReposition) {
-        HWND hForeground = GetForegroundWindow();
-        if (hForeground && hForeground != state.hWnd && 
-            hForeground != state.hCandWnd && hForeground != state.hInputWnd &&
-            hForeground != state.hBufferWnd) {
-            // 確保目標視窗保持焦點
-            DWORD currentThread = GetCurrentThreadId();
-            DWORD targetThread = GetWindowThreadProcessId(hForeground, NULL);
-            
-            if (currentThread != targetThread) {
-                AttachThreadInput(currentThread, targetThread, TRUE);
-            }
-            
-            SetForegroundWindow(hForeground);
-            
-            if (currentThread != targetThread) {
-                AttachThreadInput(currentThread, targetThread, FALSE);
-            }
-        }
-    }
-    
-    // 優化：移除狀態更新和工具列重繪，減少閃爍
-    // Utils::updateStatus(state, L"聯想字：" + selected + L" → " + 
-    //                    std::to_wstring(state.candidates.size()) + L" 個候選");
-    // if (state.hWnd) InvalidateRect(state.hWnd, nullptr, TRUE);
 }
 
 } // namespace Dictionary

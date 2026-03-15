@@ -11,6 +11,7 @@ namespace WindowManager {
     
     // 視窗程序
     LRESULT CALLBACK CandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+    LRESULT CALLBACK PredProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
     LRESULT CALLBACK BufferProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
     
     // OptimizedUI視窗程序
@@ -19,12 +20,13 @@ namespace WindowManager {
     
 	// 字碼視窗相關函數
     void drawInputWindow(HDC hdc, RECT rc, const GlobalState& state);
-    void positionInputWindow(GlobalState& state);
+    void positionInputWindow(GlobalState& state, const RECT* knownListRect = nullptr);
     LRESULT CALLBACK InputProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
     bool createInputWindow(HINSTANCE hInstance, GlobalState& state);
 	
     // 繪製函數
     void drawCandidate(HWND hwnd, HDC hdc, const GlobalState& state);
+    void drawPrediction(HWND hwnd, HDC hdc, const GlobalState& state);
     void drawBufferWindow(HDC hdc, RECT rc, GlobalState& state);
     
     // OptimizedUI繪製函數
@@ -53,6 +55,8 @@ namespace WindowManager {
     // 統一視窗定位
     void positionMainWindow(GlobalState& state);
     void positionWindowsOptimized(GlobalState& state);
+    void positionPredictionWindow(GlobalState& state);
+    void positionCandidateWindow(GlobalState& state);
     
     // OptimizedUI特定功能
     void updateBufferWindowPosition(GlobalState& state);
@@ -65,6 +69,9 @@ namespace WindowManager {
     
     // 半透明功能
     void applyTransparency(GlobalState& state);
+
+    // 輸入模式切換（統一管理相關視窗顯示）
+    void switchMode(GlobalState& state, InputMode newMode);
     
     // 公共消息處理函數（用於消除重複代碼）
     LRESULT handleKeyboardInput(HWND hwnd, WPARAM wp);

@@ -30,7 +30,8 @@ int calculateBufferWindowHeight(const GlobalState& state) {
 
 void saveBufferToFile(const GlobalState& state) {
     try {
-        std::ofstream file("text_buffer.txt", std::ios::out | std::ios::binary);
+        std::string path = Utils::wstrToUtf8(state.userDir + L"text_buffer.txt");
+        std::ofstream file(path, std::ios::out | std::ios::binary);
         if (file.is_open()) {
             const char bom[] = {static_cast<char>(0xEF), 
                                static_cast<char>(0xBB), 
@@ -46,7 +47,8 @@ void saveBufferToFile(const GlobalState& state) {
 
 void loadBufferFromFile(GlobalState& state) {
     try {
-        std::ifstream file("text_buffer.txt", std::ios::binary);
+        std::string path = Utils::wstrToUtf8(state.userDir + L"text_buffer.txt");
+        std::ifstream file(path, std::ios::binary);
         if (file.is_open()) {
             std::string content((std::istreambuf_iterator<char>(file)),
                               std::istreambuf_iterator<char>());
@@ -79,8 +81,9 @@ void saveBufferToTimestampedFile(const GlobalState& state) {
                    timeinfo->tm_min,
                    timeinfo->tm_sec);
         
-        std::string filenameStr = Utils::wstrToUtf8(std::wstring(filename));
-        std::ofstream file(filenameStr, std::ios::out | std::ios::binary);
+        std::wstring fullPath = state.userDir + filename;
+        std::string pathStr = Utils::wstrToUtf8(fullPath);
+        std::ofstream file(pathStr, std::ios::out | std::ios::binary);
         if (file.is_open()) {
             const char bom[] = {static_cast<char>(0xEF), 
                                static_cast<char>(0xBB), 

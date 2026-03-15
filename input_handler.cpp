@@ -108,8 +108,8 @@ void toggleInputMode(GlobalState& state) {
     state.isInputting = false;
     state.inputError = false;
     state.showPunctMenu = false;
-    if (state.hCandWnd) ShowWindow(state.hCandWnd, SW_HIDE);
-    if (state.hInputWnd) ShowWindow(state.hInputWnd, SW_HIDE);
+    // 切換中英文模式時，回到空閒狀態並隱藏所有輸入相關視窗
+    WindowManager::switchMode(state, InputMode::IDLE);
 
     // 注意：不再使用 IME API，改用鍵盤鉤子直接轉換字母
 
@@ -160,20 +160,26 @@ void processStroke(GlobalState& state, DWORD key) {
         return;
     }
     wchar_t inputChar = 0;
-    switch (key) {
-        case 'U': inputChar = L'u'; break;
-        case 'I': inputChar = L'i'; break;
-        case 'O': inputChar = L'o'; break;
-        case 'J': inputChar = L'j'; break;
-        case 'K': inputChar = L'k'; break;
-        case 'L': inputChar = L'*'; break;
-        case VK_NUMPAD7: inputChar = L'u'; break;
-        case VK_NUMPAD8: inputChar = L'i'; break;
-        case VK_NUMPAD9: inputChar = L'o'; break;
-        case VK_NUMPAD4: inputChar = L'j'; break;
-        case VK_NUMPAD5: inputChar = L'k'; break;
-        case VK_NUMPAD0: inputChar = L'*'; break;
+    
+    // 筆劃鍵（固定對應 u i o j k）
+    if (key == 'U' || key == VK_NUMPAD7) {
+        inputChar = L'u';
+    } else if (key == 'I' || key == VK_NUMPAD8) {
+        inputChar = L'i';
+    } else if (key == 'O' || key == VK_NUMPAD9) {
+        inputChar = L'o';
+    } else if (key == 'J' || key == VK_NUMPAD4) {
+        inputChar = L'j';
+    } else if (key == 'K' || key == VK_NUMPAD5) {
+        inputChar = L'k';
     }
+    
+    // 3+3 模式萬用字元 *（可由設定檔指定按鍵，預設為 L 與 NumPad0）
+    if (key == static_cast<DWORD>(state.wildcardKey1VK) ||
+        key == static_cast<DWORD>(state.wildcardKey2VK)) {
+        inputChar = L'*';
+    }
+    
     if (inputChar) {
         state.input += inputChar;
         Dictionary::updateCandidates(state);
@@ -192,11 +198,11 @@ void showPunctMenu(GlobalState& state) {
     state.currentPage = 0;
     state.totalPages = (state.candidates.size() + CANDIDATES_PER_PAGE - 1) / CANDIDATES_PER_PAGE;
     state.showCand = true;
-    
-    // 重新定位並調整候選字視窗大小以適應標點選單
+
+    // 標點選單視為一般候選模式：顯示候選視窗、隱藏聯想視窗
+    WindowManager::switchMode(state, InputMode::CAND_MODE);
+    WindowManager::positionWindowsOptimized(state);
     if (state.hCandWnd) {
-        WindowManager::positionWindowsOptimized(state);
-        ShowWindow(state.hCandWnd, SW_SHOW);
         InvalidateRect(state.hCandWnd, nullptr, TRUE);
     }
     
@@ -230,6 +236,12 @@ void processPunctuator(GlobalState& state, DWORD key) {
         case '6': if (isShiftPressed) punctChar = L"^"; break;
         case '7': if (isShiftPressed) punctChar = L"&"; break;
         case '8': if (isShiftPressed) punctChar = L"*"; break;
+        // Num Lock 小鍵盤標點
+        case VK_MULTIPLY: punctChar = L"*"; break;
+        case VK_ADD: punctChar = L"+"; break;
+        case VK_SUBTRACT: punctChar = L"-"; break;
+        case VK_DECIMAL: punctChar = L"."; break;
+        case VK_DIVIDE: punctChar = L"/"; break;
     }
     
     if (!punctChar.empty()) {
@@ -306,6 +318,30 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
             return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
         }
         
+        // 中文模式按住 Shift + A-Z：先清空輸入框再直接輸出英文字母（須在 A-Z 轉英文與 Shift+P 之前）
+        if (!g_state.bufferMode && wParam == WM_KEYDOWN && g_state.chineseMode) {
+            bool shiftDown = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            bool capsLock = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
+            if (shiftDown && key >= 'A' && key <= 'Z') {
+                if (!g_state.input.empty()) {
+                    g_state.input.clear();
+                    g_state.candidates.clear();
+                    g_state.candidateCodes.clear();
+                    g_state.showCand = false;
+                    g_state.isInputting = false;
+                    g_state.inputError = false;
+                    if (g_state.hCandWnd) ShowWindow(g_state.hCandWnd, SW_HIDE);
+                    if (g_state.hPredWnd) ShowWindow(g_state.hPredWnd, SW_HIDE);
+                    if (g_state.hInputWnd) ShowWindow(g_state.hInputWnd, SW_HIDE);
+                }
+                bool uppercase = capsLock;
+                wchar_t ch = uppercase ? (wchar_t)key : (wchar_t)(key + 32);
+                std::wstring letter(1, ch);
+                InputHandler::sendTextDirectUnicode(letter);
+                return 1;
+            }
+        }
+        
         // 🔥 新方案：在中文/英文模式下，將字母鍵直接轉換成英文字母輸出
         // 這樣即使 Windows 輸入法（如速成）在處理，也會被轉換成英文，避免衝突
         if (!g_state.bufferMode && wParam == WM_KEYDOWN) {
@@ -314,12 +350,15 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 bool shouldIntercept = false;
                 
                 if (g_state.chineseMode) {
-                    // 中文模式：只攔截非筆劃鍵的字母
+                    // 中文模式：只攔截「不是筆劃鍵 / 萬用字元鍵」的英文字母
+                    bool isWildcardKey =
+                        key == static_cast<DWORD>(g_state.wildcardKey1VK) ||
+                        key == static_cast<DWORD>(g_state.wildcardKey2VK);
                     bool isStrokeKey = (key == 'U' || key == 'I' || key == 'O' || 
-                                       key == 'J' || key == 'K' || key == 'L' || key == 'P');
+                                       key == 'J' || key == 'K' || key == 'P' || isWildcardKey);
                     shouldIntercept = !isStrokeKey;
                 } else {
-                    // 英文模式：攔截所有字母鍵
+                    // 英文模式：攔截所有字母鍵，統一由本輸入法送英文，避免與 Windows 自帶輸入法衝突
                     shouldIntercept = true;
                 }
                 
@@ -387,32 +426,34 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
         }
         
         if (wParam == WM_KEYDOWN) {
-            // 注意：非筆劃鍵的字母轉換已在函數開頭處理
-            
             if (g_state.shiftPressed && key != VK_SHIFT && key != VK_LSHIFT && key != VK_RSHIFT) {
                 g_state.shiftUsedForCombo = true;
             }
 
             if (key == VK_ESCAPE) {
-    // 只有當輸入法真的需要處理ESC時才攔截
-    if (g_state.showCand || g_state.showPunctMenu || g_state.isInputting) {
-        // 有候選字、標點選單或正在輸入時，由輸入法處理
-        PostMessage(g_state.hWnd, WM_USER+100, VK_ESCAPE, 0);
-        return 1;
-    }
-    
-    // 暫放模式下有焦點時的特殊處理
-    if (g_state.bufferMode && g_state.bufferHasFocus) {
-        // 讓ESC鍵通過到目標應用程式
-        return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
-    }
-    
-    // 其他情況：輸入法沒有在使用，讓ESC鍵通過給其他程式
-    return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
-}
+                // 右鍵選單顯示期間，一律讓 ESC 交給系統 / 選單處理，避免被輸入法攔截
+                if (g_state.menuShowing) {
+                    return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
+                }
 
-            // 數字鍵優先用於選字
-            if (key >= '1' && key <= '9') {
+                // 只有當輸入法真的需要處理 ESC 時才攔截
+                if (g_state.showCand || g_state.showPunctMenu || g_state.isInputting) {
+                    // 有候選字、標點選單或正在輸入時，由輸入法處理
+                    PostMessage(g_state.hWnd, WM_USER+100, VK_ESCAPE, 0);
+                    return 1;
+                }
+    
+                // 暫放模式下有焦點時的特殊處理：讓 ESC 通過到目標應用程式
+                if (g_state.bufferMode && g_state.bufferHasFocus) {
+                    return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
+                }
+    
+                // 其他情況：輸入法沒有在使用，讓 ESC 通過給其他程式
+                return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
+            }
+
+            // 數字鍵優先用於選字（暫放模式下改由暫放專用邏輯處理，避免攔截 Shift+數字標點）
+            if (!g_state.bufferMode && key >= '1' && key <= '9') {
                 if (g_state.showCand && g_state.isInputting) {
                     PostMessage(g_state.hWnd, WM_USER+100, key, 0);
                     return 1;
@@ -435,11 +476,12 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 if (isBufferWindowActive) {
                     shouldInterceptForBuffer = true;
                 } else {
+                    // 主鍵盤 0 在暫放模式下一律攔截並寫入暫放；1–9 僅在無候選時攔截（有候選時留給選字）
+                    // Num Lock 小鍵盤（0–9、* + - . /）一律攔截並寫入暫放
                     shouldInterceptForBuffer = (
                         (key >= 'A' && key <= 'Z') ||
-                        (key >= '0' && key <= '9' && !g_state.showCand) ||
-                        (key == VK_NUMPAD7 || key == VK_NUMPAD8 || key == VK_NUMPAD9 || 
-                         key == VK_NUMPAD4 || key == VK_NUMPAD5 || key == VK_NUMPAD0) ||
+                        (key >= '0' && key <= '9' && (!g_state.showCand || key == '0')) ||
+                        (key >= VK_NUMPAD0 && key <= VK_DIVIDE) ||
                         (key == 'U' || key == 'I' || key == 'O' || key == 'J' || key == 'K' || key == 'L') ||
                         (key == VK_OEM_COMMA || key == VK_OEM_PERIOD || key == VK_OEM_2 ||
                          key == VK_OEM_1 || key == VK_OEM_4 || key == VK_OEM_6 || key == VK_OEM_7 ||
@@ -460,25 +502,47 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
             // 暫放視窗輸入處理
             if (isBufferWindowActive) {
-                // 如果有候選字或標點符號選單打開，數字鍵應該用於選擇候選項
-                if ((g_state.showCand || g_state.showPunctMenu) && (key >= '1' && key <= '9')) {
+                // 如果有候選字或標點符號選單打開，數字鍵（未按 Shift）用於選擇候選項；Shift+數字則強制輸入標點到暫放視窗
+                if ((g_state.showCand || g_state.showPunctMenu) && (key >= '1' && key <= '9') && !g_state.shiftPressed) {
                     PostMessage(g_state.hWnd, WM_USER+100, key, 0);
                     return 1;
                 }
                 
-                // 方向鍵控制
-                if (key == VK_LEFT || key == VK_RIGHT || key == VK_HOME || key == VK_END) {
-                    switch(key) {
-                        case VK_LEFT: BufferManager::moveCursor(g_state, -1); break;
-                        case VK_RIGHT: BufferManager::moveCursor(g_state, 1); break;
-                        case VK_HOME: 
-                            g_state.bufferCursorPos = 0;
-                            if (g_state.hBufferWnd) InvalidateRect(g_state.hBufferWnd, nullptr, TRUE);
-                            break;
-                        case VK_END: 
-                            g_state.bufferCursorPos = g_state.bufferText.length();
-                            if (g_state.hBufferWnd) InvalidateRect(g_state.hBufferWnd, nullptr, TRUE);
-                            break;
+                // 方向鍵控制（含主鍵盤上下左右、Home/End，以及 NumLock 關閉時小鍵盤 2/4/6/8）
+                DWORD navKey = 0;
+                if (key == VK_LEFT || key == VK_RIGHT || key == VK_UP || key == VK_DOWN || key == VK_HOME || key == VK_END) {
+                    navKey = key;
+                } else if ((GetKeyState(VK_NUMLOCK) & 1) == 0) {
+                    // NumLock 關閉時，小鍵盤 2/4/6/8 為下/左/右/上
+                    switch (key) {
+                        case VK_NUMPAD2: navKey = VK_DOWN; break;
+                        case VK_NUMPAD4: navKey = VK_LEFT; break;
+                        case VK_NUMPAD6: navKey = VK_RIGHT; break;
+                        case VK_NUMPAD8: navKey = VK_UP; break;
+                        default: break;
+                    }
+                }
+                if (navKey != 0) {
+                    if (navKey == VK_LEFT) {
+                        BufferManager::moveCursor(g_state, -1);
+                    } else if (navKey == VK_RIGHT) {
+                        BufferManager::moveCursor(g_state, 1);
+                    } else if (navKey == VK_HOME) {
+                        g_state.bufferCursorPos = 0;
+                        if (g_state.hBufferWnd) InvalidateRect(g_state.hBufferWnd, nullptr, TRUE);
+                    } else if (navKey == VK_END) {
+                        g_state.bufferCursorPos = g_state.bufferText.length();
+                        if (g_state.hBufferWnd) InvalidateRect(g_state.hBufferWnd, nullptr, TRUE);
+                    } else if (navKey == VK_UP || navKey == VK_DOWN) {
+                        // 依目前光標位置計算座標，再往上一行或下一行移動
+                        POINT pt = BufferManager::getPointFromTextPosition(g_state, g_state.bufferCursorPos);
+                        int lineHeight = g_state.bufferFontSize + 2;
+                        if (navKey == VK_UP) {
+                            pt.y -= lineHeight;
+                        } else {
+                            pt.y += lineHeight;
+                        }
+                        BufferManager::setCursorPosition(g_state, pt.x, pt.y);
                     }
                     return 1;
                 }
@@ -507,28 +571,29 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
                 }
                 
-                // NumPad筆劃輸入支援
+                // NumPad筆劃輸入支援（包含萬用字元 * 對應的小鍵盤鍵）；暫放+中文模式下仍當筆劃
                 bool isNumpadStrokeKey = (key == VK_NUMPAD7 || key == VK_NUMPAD8 || key == VK_NUMPAD9 || 
-                                         key == VK_NUMPAD4 || key == VK_NUMPAD5 || key == VK_NUMPAD0);
+                                         key == VK_NUMPAD4 || key == VK_NUMPAD5 || key == VK_NUMPAD0 ||
+                                         key == static_cast<DWORD>(g_state.wildcardKey2VK));
                 if (isNumpadStrokeKey && g_state.chineseMode) {
                     PostMessage(g_state.hWnd, WM_USER+100, key, 0);
                     return 1;
                 }
 				
-				// 新增：處理所有 Numpad 數字鍵的直接輸入
+				// 處理所有 Numpad 鍵：中文模式下 7,8,9,4,5,0 可當筆劃；其餘為數字/運算符寫入暫放
 				if ((key >= VK_NUMPAD0 && key <= VK_DIVIDE)) {
-    // 中文模式下，某些 Numpad 鍵用於筆劃輸入
     if (g_state.chineseMode && !g_state.showCand) {
         bool isStrokeKey = (key == VK_NUMPAD7 || key == VK_NUMPAD8 || 
                            key == VK_NUMPAD9 || key == VK_NUMPAD4 || 
-                           key == VK_NUMPAD5 || key == VK_NUMPAD0);
+                           key == VK_NUMPAD5 || key == VK_NUMPAD0 ||
+                           key == static_cast<DWORD>(g_state.wildcardKey2VK));
         if (isStrokeKey) {
             PostMessage(g_state.hWnd, WM_USER+100, key, 0);
             return 1;
         }
     }
     
-    // 其他情況下直接輸入對應字符
+    // 其餘情況：直接輸入對應數字/運算符
     wchar_t ch = 0;
     switch(key) {
         // 數字鍵
@@ -552,12 +617,30 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     
     if (ch != 0) {
         BufferManager::insertTextAtCursor(g_state, std::wstring(1, ch));
+        // 暫放模式：輸入標點時，同步清空/隱藏輸入視窗與候選/聯想視窗（效果類似按 ESC）
+        if (ch == L'*' || ch == L'+' || ch == L'-' || ch == L'.' || ch == L'/') {
+            g_state.input.clear();
+            g_state.candidates.clear();
+            g_state.candidateCodes.clear();
+            g_state.showCand = false;
+            g_state.isInputting = false;
+            g_state.inputError = false;
+            g_state.showPunctMenu = false;
+            if (g_state.hCandWnd) ShowWindow(g_state.hCandWnd, SW_HIDE);
+            if (g_state.hPredWnd) ShowWindow(g_state.hPredWnd, SW_HIDE);
+            if (g_state.hInputWnd) ShowWindow(g_state.hInputWnd, SW_HIDE);
+            if (g_state.hWnd) InvalidateRect(g_state.hWnd, nullptr, TRUE);
+        }
         return 1;
     }
 }
                 
-                // 普通筆劃輸入（包含P鍵用於標點選單）
-                bool isStrokeKey = (key == 'U' || key == 'I' || key == 'O' || key == 'J' || key == 'K' || key == 'L' || key == 'P');
+                // 普通筆劃輸入（包含P鍵用於標點選單，與萬用字元 * 鍵）
+                bool isWildcardKey =
+                    key == static_cast<DWORD>(g_state.wildcardKey1VK) ||
+                    key == static_cast<DWORD>(g_state.wildcardKey2VK);
+                bool isStrokeKey = (key == 'U' || key == 'I' || key == 'O' ||
+                                    key == 'J' || key == 'K' || key == 'P' || isWildcardKey);
                 if (isStrokeKey && g_state.chineseMode) {
                     PostMessage(g_state.hWnd, WM_USER+100, key, 0);
                     return 1;
@@ -582,12 +665,24 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     }
                     if (!punctChar.empty()) {
                         BufferManager::insertTextAtCursor(g_state, punctChar);
+                        // 暫放模式：Shift+數字/逗點/句點輸入標點後，同步清空/隱藏輸入相關視窗
+                        g_state.input.clear();
+                        g_state.candidates.clear();
+                        g_state.candidateCodes.clear();
+                        g_state.showCand = false;
+                        g_state.isInputting = false;
+                        g_state.inputError = false;
+                        g_state.showPunctMenu = false;
+                        if (g_state.hCandWnd) ShowWindow(g_state.hCandWnd, SW_HIDE);
+                        if (g_state.hPredWnd) ShowWindow(g_state.hPredWnd, SW_HIDE);
+                        if (g_state.hInputWnd) ShowWindow(g_state.hInputWnd, SW_HIDE);
+                        if (g_state.hWnd) InvalidateRect(g_state.hWnd, nullptr, TRUE);
                         return 1;
                     }
                 }
                 
-                // 數字輸入（沒有候選字時）
-                if ((key >= '0' && key <= '9' && !g_state.shiftPressed && !g_state.showCand)) {
+                // 數字輸入：主鍵盤 0 一律寫入暫放；1–9 僅在無候選時寫入（有候選時已在上方用於選字）
+                if (key >= '0' && key <= '9' && !g_state.shiftPressed && (!g_state.showCand || key == '0')) {
 					// 暫放模式下數字一律輸入半形
 					wchar_t halfWidthNum = key;
 					std::wstring converted(1, halfWidthNum);
@@ -645,6 +740,18 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     
                     if (!punctChar.empty()) {
                         BufferManager::insertTextAtCursor(g_state, punctChar);
+                        // 暫放模式：主鍵盤標點（無 Shift）後也清空/隱藏輸入相關視窗
+                        g_state.input.clear();
+                        g_state.candidates.clear();
+                        g_state.candidateCodes.clear();
+                        g_state.showCand = false;
+                        g_state.isInputting = false;
+                        g_state.inputError = false;
+                        g_state.showPunctMenu = false;
+                        if (g_state.hCandWnd) ShowWindow(g_state.hCandWnd, SW_HIDE);
+                        if (g_state.hPredWnd) ShowWindow(g_state.hPredWnd, SW_HIDE);
+                        if (g_state.hInputWnd) ShowWindow(g_state.hInputWnd, SW_HIDE);
+                        if (g_state.hWnd) InvalidateRect(g_state.hWnd, nullptr, TRUE);
                         return 1;
                     }
                 }
@@ -667,8 +774,56 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     
 						if (!punctChar.empty()) {
 							BufferManager::insertTextAtCursor(g_state, punctChar);
+                            // 暫放模式：主鍵盤 Shift+標點 後清空/隱藏輸入相關視窗
+                            g_state.input.clear();
+                            g_state.candidates.clear();
+                            g_state.candidateCodes.clear();
+                            g_state.showCand = false;
+                            g_state.isInputting = false;
+                            g_state.inputError = false;
+                            g_state.showPunctMenu = false;
+                            if (g_state.hCandWnd) ShowWindow(g_state.hCandWnd, SW_HIDE);
+                            if (g_state.hPredWnd) ShowWindow(g_state.hPredWnd, SW_HIDE);
+                            if (g_state.hInputWnd) ShowWindow(g_state.hInputWnd, SW_HIDE);
+                            if (g_state.hWnd) InvalidateRect(g_state.hWnd, nullptr, TRUE);
 							return 1;
                     }
+                }
+            }
+
+            // 暫放模式：當候選/輸入視窗顯示（焦點不在暫放視窗）時，Shift+數字/逗號/句點仍強制寫入暫放視窗並清空視窗
+            if (g_state.bufferMode && !isBufferWindowActive && g_state.shiftPressed &&
+                ((key >= '0' && key <= '9') || key == VK_OEM_COMMA || key == VK_OEM_PERIOD)) {
+                std::wstring punctChar = L"";
+                switch (key) {
+                    case '1': punctChar = g_state.chineseMode ? L"！" : L"!"; break;
+                    case '2': punctChar = g_state.chineseMode ? L"＠" : L"@"; break;
+                    case '3': punctChar = g_state.chineseMode ? L"＃" : L"#"; break;
+                    case '4': punctChar = g_state.chineseMode ? L"＄" : L"$"; break;
+                    case '5': punctChar = g_state.chineseMode ? L"％" : L"%"; break;
+                    case '6': punctChar = g_state.chineseMode ? L"⌃" : L"^"; break;
+                    case '7': punctChar = g_state.chineseMode ? L"＆" : L"&"; break;
+                    case '8': punctChar = g_state.chineseMode ? L"＊" : L"*"; break;
+                    case '9': punctChar = g_state.chineseMode ? L"（" : L"("; break;
+                    case '0': punctChar = g_state.chineseMode ? L"）" : L")"; break;
+                    case VK_OEM_COMMA: punctChar = g_state.chineseMode ? L"《" : L"<"; break;
+                    case VK_OEM_PERIOD: punctChar = g_state.chineseMode ? L"》" : L">"; break;
+                }
+                if (!punctChar.empty()) {
+                    BufferManager::insertTextAtCursor(g_state, punctChar);
+                    g_state.input.clear();
+                    g_state.candidates.clear();
+                    g_state.candidateCodes.clear();
+                    g_state.showCand = false;
+                    g_state.isInputting = false;
+                    g_state.inputError = false;
+                    g_state.showPunctMenu = false;
+                    if (g_state.hCandWnd) ShowWindow(g_state.hCandWnd, SW_HIDE);
+                    if (g_state.hPredWnd) ShowWindow(g_state.hPredWnd, SW_HIDE);
+                    if (g_state.hInputWnd) ShowWindow(g_state.hInputWnd, SW_HIDE);
+                    if (g_state.hWnd) InvalidateRect(g_state.hWnd, nullptr, TRUE);
+                    if (g_state.hBufferWnd) InvalidateRect(g_state.hBufferWnd, nullptr, TRUE);
+                    return 1;
                 }
             }
 
@@ -682,18 +837,22 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
             // 正常中文輸入處理
             if (!g_state.bufferMode || !isBufferWindowActive) {
-                bool isStrokeKey = (key == 'U' || key == 'I' || key == 'O' || key == 'J' || key == 'K' || key == 'L' || key == 'P' ||
+                bool isWildcardKey =
+                    key == static_cast<DWORD>(g_state.wildcardKey1VK) ||
+                    key == static_cast<DWORD>(g_state.wildcardKey2VK);
+                bool isStrokeKey = (key == 'U' || key == 'I' || key == 'O' || key == 'J' || key == 'K' || key == 'P' || isWildcardKey ||
                                     key == VK_NUMPAD7 || key == VK_NUMPAD8 || key == VK_NUMPAD9 || 
                                     key == VK_NUMPAD4 || key == VK_NUMPAD5 || key == VK_NUMPAD0);
 
                 bool isPunctKey = (key == VK_OEM_COMMA || key == VK_OEM_PERIOD || key == VK_OEM_2 ||
                        key == VK_OEM_1 || key == VK_OEM_4 || key == VK_OEM_6 || key == VK_OEM_7 ||
                        key == VK_OEM_MINUS || key == VK_OEM_PLUS || key == VK_OEM_5 || key == VK_OEM_3 ||
-                       (key == '1' && g_state.shiftPressed) || (key == '2' && g_state.shiftPressed) || 
-                       (key == '3' && g_state.shiftPressed) || (key == '4' && g_state.shiftPressed) || 
-                       (key == '5' && g_state.shiftPressed) || (key == '6' && g_state.shiftPressed) || 
-                       (key == '7' && g_state.shiftPressed) || (key == '8' && g_state.shiftPressed) || 
-                       (key == '9' && g_state.shiftPressed) || (key == '0' && g_state.shiftPressed));
+                       (key == '1' && g_state.shiftPressed) || (key == '2' && g_state.shiftPressed) ||
+                       (key == '3' && g_state.shiftPressed) || (key == '4' && g_state.shiftPressed) ||
+                       (key == '5' && g_state.shiftPressed) || (key == '6' && g_state.shiftPressed) ||
+                       (key == '7' && g_state.shiftPressed) || (key == '8' && g_state.shiftPressed) ||
+                       (key == '9' && g_state.shiftPressed) || (key == '0' && g_state.shiftPressed) ||
+                       key == VK_MULTIPLY || key == VK_ADD || key == VK_SUBTRACT || key == VK_DECIMAL || key == VK_DIVIDE);
                 
                 bool isFunctionKey = ((g_state.isInputting || g_state.showPunctMenu) && 
                           (key == VK_SPACE || key == VK_BACK || key == VK_ESCAPE ||

@@ -64,15 +64,16 @@ namespace DictUpdater {
     // updateUrl: Update.md 的 URL（如果为空则使用默认URL）
     // forceCheck: 是否强制检查（忽略缓存），默认 false
     // cacheHours: 缓存有效期（小时），默认 24 小时
+    // versionCachePath: 版本快取檔完整路徑（若為空則使用預設檔名於當前目錄）
     // 返回版本号字符串，失败返回空字符串
-    std::string getRemoteVersion(const char* updateUrl = nullptr, bool forceCheck = false, int cacheHours = 24);
+    std::string getRemoteVersion(const char* updateUrl = nullptr, bool forceCheck = false, int cacheHours = 24, const char* versionCachePath = nullptr);
     
-    // 保存版本检查缓存（内部使用）
-    void saveVersionCache(const std::string& version, time_t checkTime);
+    // 保存版本检查缓存（内部使用；cachePath 為空時使用 VERSION_CACHE_FILE）
+    void saveVersionCache(const std::string& version, time_t checkTime, const char* cachePath = nullptr);
     
-    // 加载版本检查缓存（内部使用）
+    // 加载版本检查缓存（内部使用；cachePath 為空時使用 VERSION_CACHE_FILE）
     // 返回缓存的版本号，如果缓存过期或不存在返回空字符串
-    std::string loadVersionCache(time_t& checkTime, int cacheHours = 24);
+    std::string loadVersionCache(time_t& checkTime, int cacheHours = 24, const char* cachePath = nullptr);
 }
 
 #endif // DICT_UPDATER_H

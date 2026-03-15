@@ -16,8 +16,24 @@ GlobalState g_state;
 HHOOK g_hKeyboardHook = NULL;
 TrayManager::TrayIconData g_trayIcon;
 
+// 在載入任何檔案之前初始化 system/user 目錄路徑並建立目錄
+static void initDirectories(GlobalState& state) {
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    std::wstring exeDir = exePath;
+    exeDir = exeDir.substr(0, exeDir.find_last_of(L"\\/") + 1);
+
+    state.systemDir = exeDir + L"system\\";
+    state.userDir   = exeDir + L"user\\";
+
+    CreateDirectoryW(state.systemDir.c_str(), NULL);
+    CreateDirectoryW(state.userDir.c_str(), NULL);
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShowCmd) {
     try {
+        initDirectories(g_state);
+
         // 初始化輸入法管理器（避免與 Windows 輸入法衝突）
         IMEManager::initialize();
         
@@ -26,11 +42,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         
         // 載入設定
         ConfigLoader::loadInterfaceConfig(g_state);
-        Dictionary::loadMainDict("Zi-Ma-Biao.txt", g_state);
+        Dictionary::loadMainDict(g_state);
         Dictionary::loadPunctuator(g_state);
         Dictionary::loadPunctMenu(g_state);
         Dictionary::loadUserDict(g_state);
         Dictionary::loadWordPhrases(g_state);  // 載入詞語庫（可選）
+        Dictionary::loadContextLearning(g_state);  // 載入智能聯想引擎的個人上下文學習記錄
         
         // 載入位置記憶
         PositionManager::loadPositions(g_state);
@@ -56,8 +73,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             ShowWindow(g_state.hInputWnd, SW_HIDE);  // 初始隱藏
         }
 		
-        // 確保視窗位置在可見區域
+        // 確保視窗位置在可見區域，並限制在工作區內（避免被工作列遮蓋）、使用正確工具列尺寸
         PositionManager::ensureVisiblePosition(g_state);
+        WindowManager::positionMainWindow(g_state);
         
         // 安裝鍵盤鉤子
         g_hKeyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, InputHandler::KeyboardHookProc, hInstance, 0);
@@ -105,6 +123,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         
         // 儲存用戶設定和學習記錄
         Dictionary::saveUserDict(g_state);
+        Dictionary::saveContextLearning(g_state);  // 儲存智能聯想引擎的個人上下文學習記錄
         PositionManager::savePositions(g_state);
         
         // 移除系統托盤圖示

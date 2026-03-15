@@ -18,4 +18,5 @@ $(TARGET): $(OBJS)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	@if exist *.o del /F /Q *.o 2>nul
+	@if exist $(TARGET) del /F /Q $(TARGET) 2>nul

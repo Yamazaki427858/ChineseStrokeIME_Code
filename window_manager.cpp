@@ -16,7 +16,56 @@
 extern TrayManager::TrayIconData g_trayIcon;
 extern HHOOK g_hKeyboardHook;
 
+// 進階優化：滑鼠觸發重繪節流（延遲 50ms 合併，減少 WM_PAINT 次數）
+static const UINT DEFERRED_INVALIDATE_TIMER_ID = 992;
+static const UINT DEFERRED_MAIN = 1, DEFERRED_CAND = 2, DEFERRED_PRED = 4, DEFERRED_BUFFER = 8;
+static UINT g_deferredInvalidateFlags = 0;
+static bool g_deferredInvalidateScheduled = false;
+static void scheduleDeferredInvalidate(UINT mask) {
+    g_deferredInvalidateFlags |= mask;
+    if (!g_deferredInvalidateScheduled && g_state.hWnd) {
+        g_deferredInvalidateScheduled = true;
+        SetTimer(g_state.hWnd, DEFERRED_INVALIDATE_TIMER_ID, 50, NULL);
+    }
+}
+
 namespace WindowManager {
+
+// 輸入模式切換的統一入口：負責維護視窗顯示與舊旗標同步
+void switchMode(GlobalState& state, InputMode newMode) {
+    if (state.currentMode == newMode) {
+        return;
+    }
+
+    state.currentMode = newMode;
+
+    switch (newMode) {
+    case InputMode::IDLE:
+        // 空閒：所有相關視窗隱藏
+        if (state.hCandWnd) ShowWindow(state.hCandWnd, SW_HIDE);
+        if (state.hPredWnd) ShowWindow(state.hPredWnd, SW_HIDE);
+        if (state.hInputWnd) ShowWindow(state.hInputWnd, SW_HIDE);
+        state.showCand = false;
+        state.isPredictionMode = false;
+        break;
+
+    case InputMode::CAND_MODE:
+        // 字碼候選模式：顯示候選視窗，隱藏聯想視窗
+        if (state.hPredWnd) ShowWindow(state.hPredWnd, SW_HIDE);
+        if (state.hCandWnd) ShowWindow(state.hCandWnd, SW_SHOW);
+        state.showCand = true;
+        state.isPredictionMode = false;
+        break;
+
+    case InputMode::PRED_MODE:
+        // 聯想字模式：顯示聯想視窗，隱藏候選視窗
+        if (state.hCandWnd) ShowWindow(state.hCandWnd, SW_HIDE);
+        if (state.hPredWnd) ShowWindow(state.hPredWnd, SW_SHOW);
+        state.showCand = true;
+        state.isPredictionMode = true;
+        break;
+    }
+}
 
 
 // ========== 【日後修改關於對話框內容請修改此函數】 ==========
@@ -60,7 +109,8 @@ void showAboutDialog(HWND hwnd) {
     // 如果用户选择检查更新
     if (checkResult == IDYES) {
         // 手动检查更新（强制检查，忽略缓存，获取最新版本）
-        std::string remoteVersion = DictUpdater::getRemoteVersion(nullptr, true);
+        std::string versionCachePath = Utils::wstrToUtf8(g_state.systemDir + L"version_cache.txt");
+        std::string remoteVersion = DictUpdater::getRemoteVersion(nullptr, true, 24, versionCachePath.c_str());
         
         if (remoteVersion.empty()) {
             // 无法获取远程版本（网络错误或缓存过期且网络不可用）
@@ -95,6 +145,11 @@ void showAboutDialog(HWND hwnd) {
 
 
 
+// 進階優化：候選字視窗字型快取（避免每次 WM_PAINT 建立/刪除 GDI 字型）
+static HFONT s_candFont = NULL;
+static int s_candFontSize = -1;
+static std::wstring s_candFontName;
+
 void drawCandidate(HWND hwnd, HDC hdc, const GlobalState& state) {
     if (state.candidates.empty()) return;
     
@@ -116,22 +171,40 @@ void drawCandidate(HWND hwnd, HDC hdc, const GlobalState& state) {
     
     SetBkMode(hdc, TRANSPARENT);
     
-    HFONT hFont = CreateFontW(
-        state.candidateFontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-        state.candidateFontName.c_str()
-    );
-    HFONT hOld = (HFONT)SelectObject(hdc, hFont);
+    // 字型快取：僅在字型參數變更時重建
+    if (!s_candFont || s_candFontSize != state.candidateFontSize || s_candFontName != state.candidateFontName) {
+        if (s_candFont) DeleteObject(s_candFont);
+        s_candFont = CreateFontW(
+            state.candidateFontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+            state.candidateFontName.c_str()
+        );
+        s_candFontSize = state.candidateFontSize;
+        s_candFontName = state.candidateFontName;
+    }
+    HFONT hOld = (HFONT)SelectObject(hdc, s_candFont);
     
     int lineHeight = state.candidateFontSize + 6;
     int startIndex = state.currentPage * CANDIDATES_PER_PAGE;
     int endIndex = std::min(startIndex + CANDIDATES_PER_PAGE, (int)state.candidates.size());
     
-    // 繪製候選字列表
+    // 繪製候選字列表（優先顯示滑鼠 hover，其次才是鍵盤選取）
     for (int i = 0; i < endIndex - startIndex; ++i) {
         int actualIndex = startIndex + i;
         
-        if (i == state.selected) {
+        if (actualIndex == state.hoverCandidateIndex) {
+            // 滑鼠 hover 行優先（包含第一個候選字）
+            RECT bgRect = {8, 8 + i * lineHeight, rc.right - 8, 8 + (i + 1) * lineHeight};
+            COLORREF hoverBg = state.candidateHoverBackgroundColor ?
+                state.candidateHoverBackgroundColor : state.candidateBackgroundColor;
+            HBRUSH hBrush = CreateSolidBrush(hoverBg);
+            FillRect(hdc, &bgRect, hBrush);
+            DeleteObject(hBrush);
+            COLORREF hoverText = state.candidateHoverTextColor ?
+                state.candidateHoverTextColor : state.candidateTextColor;
+            SetTextColor(hdc, hoverText);
+        } else if (i == state.selected) {
+            // 鍵盤選取行（在沒有 hover 時才顯示）
             RECT bgRect = {8, 8 + i * lineHeight, rc.right - 8, 8 + (i + 1) * lineHeight};
             HBRUSH hBrush = CreateSolidBrush(state.selectedCandidateBackgroundColor);
             FillRect(hdc, &bgRect, hBrush);
@@ -145,15 +218,28 @@ void drawCandidate(HWND hwnd, HDC hdc, const GlobalState& state) {
         if (state.showPunctMenu) {
             txt = std::to_wstring(i+1) + L". " + state.candidates[actualIndex];
         } else {
-            std::wstring codeInfo = L" [" + state.candidateCodes[actualIndex] + L"]";
+            txt = std::to_wstring(i+1) + L". " + state.candidates[actualIndex];
+            // 先顯示字碼（非 ⚐/⚑ 時）
+            if (actualIndex < (int)state.candidateCodes.size() && !state.candidateCodes[actualIndex].empty()) {
+                const std::wstring& code = state.candidateCodes[actualIndex];
+                if (code != L"⚐" && code != L"⚑" && state.showCandidateCode) {
+                    txt += L"[" + code + L"]";
+                }
+            }
+            // ★ = user_dict（用戶詞庫／永久詞），(n) = 使用次數
             std::wstring detailInfo = L"";
-            
             if (state.wordFreq.find(state.candidates[actualIndex]) != state.wordFreq.end()) {
                 const WordInfo& info = state.wordFreq.at(state.candidates[actualIndex]);
                 detailInfo = info.isPermanent ? L" ★" : L" (" + std::to_wstring(info.frequency) + L")";
             }
-            
-            txt = std::to_wstring(i+1) + L". " + state.candidates[actualIndex] + detailInfo + codeInfo;
+            txt += detailInfo;
+            // ⚐ pinned / ⚑ locked 固定放在 ★ 或 (次數) 後面
+            if (actualIndex < (int)state.candidateCodes.size() && !state.candidateCodes[actualIndex].empty()) {
+                const std::wstring& code = state.candidateCodes[actualIndex];
+                if (code == L"⚐" || code == L"⚑") {
+                    txt += L" " + code;
+                }
+            }
         }
         
         TextOutW(hdc, 15, 10 + i * lineHeight, txt.c_str(), (int)txt.size());
@@ -229,7 +315,302 @@ void drawCandidate(HWND hwnd, HDC hdc, const GlobalState& state) {
     }
     
     SelectObject(hdc, hOld);
-    DeleteObject(hFont);
+    // 字型使用快取，不 DeleteObject
+}
+
+// 聯想字視窗字型快取
+static HFONT s_predFont = NULL;
+static int s_predFontSize = -1;
+static std::wstring s_predFontName;
+
+// 聯想字視窗繪製函數（與 drawCandidate 類似，但使用獨立顏色配置）
+void drawPrediction(HWND hwnd, HDC hdc, const GlobalState& state) {
+    if (state.candidates.empty()) return;
+    
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    
+    // 背景和邊框
+    HBRUSH hBg = CreateSolidBrush(state.predictionBackgroundColor);
+    FillRect(hdc, &rc, hBg);
+    DeleteObject(hBg);
+    
+    HPEN hPen = CreatePen(PS_SOLID, 1, RGB(180,180,180));
+    HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+    HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    Rectangle(hdc, 0, 0, rc.right, rc.bottom);
+    SelectObject(hdc, hOldBrush);
+    SelectObject(hdc, hOldPen);
+    DeleteObject(hPen);
+    
+    SetBkMode(hdc, TRANSPARENT);
+    
+    // 字型快取（與候選字視窗相同參數）
+    if (!s_predFont || s_predFontSize != state.candidateFontSize || s_predFontName != state.candidateFontName) {
+        if (s_predFont) DeleteObject(s_predFont);
+        s_predFont = CreateFontW(
+            state.candidateFontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+            state.candidateFontName.c_str()
+        );
+        s_predFontSize = state.candidateFontSize;
+        s_predFontName = state.candidateFontName;
+    }
+    HFONT hOld = (HFONT)SelectObject(hdc, s_predFont);
+    
+    int lineHeight = state.candidateFontSize + 6;
+    int startIndex = state.currentPage * CANDIDATES_PER_PAGE;
+    int endIndex = std::min(startIndex + CANDIDATES_PER_PAGE, (int)state.candidates.size());
+    
+    // 繪製聯想字列表
+    for (int i = 0; i < endIndex - startIndex; ++i) {
+        int actualIndex = startIndex + i;
+        
+        if (actualIndex == state.hoverCandidateIndex) {
+            // hover 行
+            RECT bgRect = {8, 8 + i * lineHeight, rc.right - 8, 8 + (i + 1) * lineHeight};
+            HBRUSH hBrush = CreateSolidBrush(state.predictionHoverBgColor);
+            FillRect(hdc, &bgRect, hBrush);
+            DeleteObject(hBrush);
+            SetTextColor(hdc, state.predictionHoverTextColor);
+        } else if (i == 0) {
+            // 第一個聯想字特殊底色
+            RECT bgRect = {8, 8, rc.right - 8, 8 + lineHeight};
+            HBRUSH hBrush = CreateSolidBrush(state.predictionFirstItemBgColor);
+            FillRect(hdc, &bgRect, hBrush);
+            DeleteObject(hBrush);
+            SetTextColor(hdc, state.predictionTextColor);
+        } else {
+            SetTextColor(hdc, state.predictionTextColor);
+        }
+        
+        std::wstring txt;
+        txt = std::to_wstring(i+1) + L". " + state.candidates[actualIndex];
+        
+        // 先顯示字碼（非 ⚐/⚑ 時，且開啟 showCandidateCode）
+        if (actualIndex < (int)state.candidateCodes.size() && !state.candidateCodes[actualIndex].empty()) {
+            const std::wstring& code = state.candidateCodes[actualIndex];
+            if (code != L"⚐" && code != L"⚑" && state.showCandidateCode) {
+                txt += L"[" + code + L"]";
+            }
+        }
+        
+        // ★ = user_dict（用戶詞庫／永久詞），(n) = 使用次數
+        std::wstring detailInfo = L"";
+        if (state.wordFreq.find(state.candidates[actualIndex]) != state.wordFreq.end()) {
+            const WordInfo& info = state.wordFreq.at(state.candidates[actualIndex]);
+            detailInfo = info.isPermanent ? L" ★" : L" (" + std::to_wstring(info.frequency) + L")";
+        }
+        txt += detailInfo;
+        
+        // ⚐ pinned / ⚑ locked 固定放在 ★ 或 (次數) 後面
+        if (actualIndex < (int)state.candidateCodes.size() && !state.candidateCodes[actualIndex].empty()) {
+            const std::wstring& code = state.candidateCodes[actualIndex];
+            if (code == L"⚐" || code == L"⚑") {
+                txt += L" " + code;
+            }
+        }
+        
+        TextOutW(hdc, 15, 10 + i * lineHeight, txt.c_str(), (int)txt.size());
+    }
+    
+    // 翻頁控制區域（與 drawCandidate 相同）
+    if (state.totalPages > 1) {
+        int controlY = 10 + CANDIDATES_PER_PAGE * lineHeight + 25;
+        int buttonSize = 20;
+        int buttonY = controlY;
+        
+        HPEN hSepPen = CreatePen(PS_SOLID, 1, RGB(200,200,200));
+        HPEN hOldSepPen = (HPEN)SelectObject(hdc, hSepPen);
+        MoveToEx(hdc, 10, controlY - 4, NULL);
+        LineTo(hdc, rc.right - 10, controlY - 4);
+        SelectObject(hdc, hOldSepPen);
+        DeleteObject(hSepPen);
+        
+        const_cast<GlobalState&>(state).prevPageButtonRect = {10, buttonY, 10 + buttonSize, buttonY + buttonSize};
+        COLORREF prevBtnColor = (state.currentPage > 0) ? 
+            (state.prevPageButtonHover ? RGB(180,180,180) : RGB(220,220,220)) : RGB(240,240,240);
+        HBRUSH hPrevBrush = CreateSolidBrush(prevBtnColor);
+        FillRect(hdc, &const_cast<GlobalState&>(state).prevPageButtonRect, hPrevBrush);
+        DeleteObject(hPrevBrush);
+        
+        HPEN hBtnPen = CreatePen(PS_SOLID, 1, RGB(160,160,160));
+        HPEN hOldBtnPen = (HPEN)SelectObject(hdc, hBtnPen);
+        SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        Rectangle(hdc, const_cast<GlobalState&>(state).prevPageButtonRect.left, 
+                 const_cast<GlobalState&>(state).prevPageButtonRect.top,
+                 const_cast<GlobalState&>(state).prevPageButtonRect.right, 
+                 const_cast<GlobalState&>(state).prevPageButtonRect.bottom);
+        
+        SetTextColor(hdc, (state.currentPage > 0) ? RGB(60,60,60) : RGB(180,180,180));
+        RECT upArrowRect = const_cast<GlobalState&>(state).prevPageButtonRect;
+        DrawTextW(hdc, L"▲", -1, &upArrowRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        
+        const_cast<GlobalState&>(state).nextPageButtonRect = {35, buttonY, 35 + buttonSize, buttonY + buttonSize};
+        COLORREF nextBtnColor = (state.currentPage < state.totalPages - 1) ? 
+            (state.nextPageButtonHover ? RGB(180,180,180) : RGB(220,220,220)) : RGB(240,240,240);
+        HBRUSH hNextBrush = CreateSolidBrush(nextBtnColor);
+        FillRect(hdc, &const_cast<GlobalState&>(state).nextPageButtonRect, hNextBrush);
+        DeleteObject(hNextBrush);
+        
+        Rectangle(hdc, const_cast<GlobalState&>(state).nextPageButtonRect.left, 
+                 const_cast<GlobalState&>(state).nextPageButtonRect.top,
+                 const_cast<GlobalState&>(state).nextPageButtonRect.right, 
+                 const_cast<GlobalState&>(state).nextPageButtonRect.bottom);
+        
+        SelectObject(hdc, hOldBtnPen);
+        DeleteObject(hBtnPen);
+        
+        SetTextColor(hdc, (state.currentPage < state.totalPages - 1) ? RGB(60,60,60) : RGB(180,180,180));
+        RECT downArrowRect = const_cast<GlobalState&>(state).nextPageButtonRect;
+        DrawTextW(hdc, L"▼", -1, &downArrowRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        
+        const_cast<GlobalState&>(state).pageInfoRect = {65, buttonY, rc.right - 10, buttonY + buttonSize};
+        SetTextColor(hdc, RGB(100, 100, 100));
+        std::wstring pageInfo = std::to_wstring(state.currentPage + 1) + L"/" + 
+                               std::to_wstring(state.totalPages) + L" (共" + 
+                               std::to_wstring(state.candidates.size()) + L"個)";
+        
+        RECT pageTextRect = const_cast<GlobalState&>(state).pageInfoRect;
+        DrawTextW(hdc, pageInfo.c_str(), -1, &pageTextRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    }
+    
+    SelectObject(hdc, hOld);
+    // 字型使用快取，不 DeleteObject
+}
+
+// 聯想字視窗定位函數
+// 跟隨滑鼠模式（⿻ 恢復）：用滑鼠位置；使用者固定位置模式：以 hInputWnd 為錨點，避免分離錯位。
+void positionPredictionWindow(GlobalState& state) {
+    if (!state.hPredWnd) return;
+    if (state.candidates.empty()) return;
+    
+    int candWidth  = calculateOptimalWindowWidth(state);
+    int candHeight = calculateCandidateWindowHeight(state);
+    
+    POINT basePos;
+    RECT inputRect = {};
+    bool hasInput = (state.hInputWnd != nullptr) && IsWindow(state.hInputWnd);
+    
+    // 跟隨滑鼠模式（g_useUserPosition == false）：與候選窗一致，用滑鼠位置，讓「⿻」恢復有效
+    if (!PositionManager::g_useUserPosition) {
+        basePos = PositionManager::getCurrentMousePosition();
+    }
+    // 使用者固定位置模式：以輸入窗為錨點，聯想窗緊貼不分離
+    else if (hasInput) {
+        GetWindowRect(state.hInputWnd, &inputRect);
+        basePos.x = inputRect.left;
+        basePos.y = inputRect.bottom + WINDOW_SPACING;
+        if (state.hCandWnd && state.showCand && IsWindowVisible(state.hCandWnd)) {
+            RECT candRect;
+            GetWindowRect(state.hCandWnd, &candRect);
+            basePos.y = candRect.bottom + WINDOW_SPACING;
+        }
+    } else {
+        if (PositionManager::g_userCandPos.isValid) {
+            basePos.x = PositionManager::g_userCandPos.x;
+            basePos.y = PositionManager::g_userCandPos.y;
+        } else {
+            basePos = PositionManager::getCurrentMousePosition();
+        }
+    }
+    
+    ScreenManager::updateMonitorInfo();
+    ScreenManager::MonitorInfo currentMonitor = ScreenManager::getMonitorFromPoint(basePos);
+    RECT workArea = currentMonitor.workArea;
+    const int margin = 5;
+    
+    if (basePos.x + candWidth > workArea.right - margin)
+        basePos.x = workArea.right - candWidth - margin;
+    if (basePos.x < workArea.left + margin)
+        basePos.x = workArea.left + margin;
+    if (basePos.y + candHeight > workArea.bottom - margin)
+        basePos.y = workArea.bottom - candHeight - margin;
+    if (basePos.y < workArea.top + margin)
+        basePos.y = workArea.top + margin;
+    
+    if (!state.menuShowing) {
+        SetWindowPos(state.hPredWnd, HWND_TOPMOST,
+                    basePos.x, basePos.y,
+                    candWidth, candHeight,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    } else {
+        SetWindowPos(state.hPredWnd, HWND_NOTOPMOST,
+                    basePos.x, basePos.y,
+                    candWidth, candHeight,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+    
+    InvalidateRect(state.hPredWnd, nullptr, TRUE);
+    UpdateWindow(state.hPredWnd);
+}
+
+// 字碼候選視窗定位函數（原 positionWindowsOptimized 中 CAND 模式邏輯）
+void positionCandidateWindow(GlobalState& state) {
+    // 修復：標點選單模式下也需要調整視窗
+    if (!state.isInputting && !state.showPunctMenu) return; // 不在輸入狀態且非標點選單時直接返回
+    
+    ScreenManager::updateMonitorInfo();
+    
+    // 修改：即使沒有候選字也要定位字碼視窗
+    if (!state.showCand) {
+        positionInputWindow(state);
+        return;
+    }
+    
+    int candWidth = calculateOptimalWindowWidth(state);
+    int candHeight = calculateCandidateWindowHeight(state);
+    
+    POINT basePos;
+    
+    // 如果用戶設定了固定位置，使用用戶位置；否則跟隨滑鼠（以滑鼠為錨點放置 hCandWnd）
+    if (PositionManager::g_useUserPosition && PositionManager::g_userCandPos.isValid) {
+        basePos.x = PositionManager::g_userCandPos.x;
+        basePos.y = PositionManager::g_userCandPos.y;
+    } else {
+        // 跟隨滑鼠：以當前滑鼠位置為錨點，候選窗與字碼窗整塊跟隨
+        basePos = PositionManager::getCurrentMousePosition();
+        ScreenManager::MonitorInfo currentMonitor = ScreenManager::getMonitorFromPoint(basePos);
+        RECT workArea = currentMonitor.workArea;
+        const int margin = 5;
+        int totalHeight = candHeight + INPUT_WINDOW_HEIGHT + 5;
+        
+        if (basePos.x + candWidth > workArea.right - margin)
+            basePos.x = workArea.right - candWidth - margin;
+        if (basePos.x < workArea.left + margin)
+            basePos.x = workArea.left + margin;
+        if (basePos.y + totalHeight > workArea.bottom - margin) {
+            int newY = basePos.y - totalHeight - PositionManager::g_verticalOffset;
+            if (newY >= workArea.top + margin)
+                basePos.y = newY + INPUT_WINDOW_HEIGHT + 5;
+            else
+                basePos.y = workArea.top + margin + INPUT_WINDOW_HEIGHT + 5;
+        }
+        if (basePos.y < workArea.top + INPUT_WINDOW_HEIGHT + margin)
+            basePos.y = workArea.top + INPUT_WINDOW_HEIGHT + margin;
+    }
+    
+    // 定位候選字視窗
+    if (state.hCandWnd && state.showCand && candHeight > 0) {
+        if (!state.menuShowing) {
+            SetWindowPos(state.hCandWnd, HWND_TOPMOST,
+                        basePos.x, basePos.y,
+                        candWidth, candHeight,
+                        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        } else {
+            SetWindowPos(state.hCandWnd, HWND_NOTOPMOST,
+                        basePos.x, basePos.y,
+                        candWidth, candHeight,
+                        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+        InvalidateRect(state.hCandWnd, nullptr, TRUE);
+        UpdateWindow(state.hCandWnd);
+        
+        RECT knownListRect = { basePos.x, basePos.y, basePos.x + candWidth, basePos.y + candHeight };
+        positionInputWindow(state, &knownListRect);
+    } else {
+        positionInputWindow(state);
+    }
 }
 
 int calculateOptimalWindowWidth(const GlobalState& state) {
@@ -249,7 +630,7 @@ int calculateOptimalWindowWidth(const GlobalState& state) {
             int contentWidth = 60;
             contentWidth += (int)state.candidates[i].length() * 18;
             
-            if (i < state.candidateCodes.size()) {
+            if (state.showCandidateCode && i < state.candidateCodes.size()) {
                 contentWidth += 30 + (int)state.candidateCodes[i].length() * 10;
             }
             
@@ -290,92 +671,52 @@ int calculateCandidateWindowHeight(const GlobalState& state) {
 
 // 修復：改進視窗定位邏輯，確保字碼和候選字視窗同步
 void positionWindowsOptimized(GlobalState& state) {
-    // 修復：標點選單模式下也需要調整視窗
-    if (!state.isInputting && !state.showPunctMenu) return; // 不在輸入狀態且非標點選單時直接返回
-    
-    ScreenManager::updateMonitorInfo();
-    
-    // 修改：即使沒有候選字也要定位字碼視窗
-    if (!state.showCand) {
-        positionInputWindow(state); // 定位字碼視窗
-        return;
-    }
-    
-    int candWidth = calculateOptimalWindowWidth(state);
-    int candHeight = calculateCandidateWindowHeight(state);
-    
-    POINT basePos;
-    
-    // 如果用戶設定了固定位置，使用用戶位置；否則跟隨滑鼠
-    if (PositionManager::g_useUserPosition && PositionManager::g_userCandPos.isValid) {
-        basePos.x = PositionManager::g_userCandPos.x;
-        basePos.y = PositionManager::g_userCandPos.y;
-    } else {
-        // 跟隨滑鼠位置
-        basePos = PositionManager::getCurrentMousePosition();
-        
-        ScreenManager::MonitorInfo currentMonitor = 
-            ScreenManager::getMonitorFromPoint(basePos);
-        RECT screenRect = currentMonitor.workArea;
-        
-        // 為字碼視窗預留空間
-        int totalHeight = candHeight + INPUT_WINDOW_HEIGHT + 5;
-        
-        // 調整位置確保整個視窗組合在螢幕範圍內
-        if (basePos.x + candWidth > screenRect.right - 10) {
-            basePos.x = screenRect.right - candWidth - 10;
-        }
-        if (basePos.x < screenRect.left + 10) {
-            basePos.x = screenRect.left + 10;
-        }
-        
-        if (basePos.y + totalHeight > screenRect.bottom - 30) {
-            int newY = basePos.y - totalHeight - PositionManager::g_verticalOffset;
-            if (newY >= screenRect.top + 10) {
-                basePos.y = newY + INPUT_WINDOW_HEIGHT + 5; // 調整候選字視窗位置
-            } else {
-                basePos.y = screenRect.top + 10 + INPUT_WINDOW_HEIGHT + 5;
-            }
-        }
-        if (basePos.y < screenRect.top + INPUT_WINDOW_HEIGHT + 15) {
-            basePos.y = screenRect.top + INPUT_WINDOW_HEIGHT + 15;
-        }
-    }
-    
-    // 定位候選字視窗
-    if (state.hCandWnd && state.showCand && candHeight > 0) {
-        // 只有在菜單未顯示時才設置TOPMOST
-        if (!state.menuShowing) {
-            SetWindowPos(state.hCandWnd, HWND_TOPMOST,
-                        basePos.x, basePos.y,
-                        candWidth, candHeight,
-                        SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        } else {
-            SetWindowPos(state.hCandWnd, HWND_NOTOPMOST,
-                        basePos.x, basePos.y,
-                        candWidth, candHeight,
-                        SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        }
-        InvalidateRect(state.hCandWnd, nullptr, TRUE);
-        
-        // 關鍵修改：候選字視窗定位後，立即定位字碼視窗（確保同步）
-        // 使用 UpdateWindow 和 Sleep 確保候選字視窗位置已完全更新
-        UpdateWindow(state.hCandWnd);
-        Sleep(10);  // 短暫延遲確保視窗位置已更新
+    switch (state.currentMode) {
+    case InputMode::CAND_MODE:
+        positionCandidateWindow(state);
+        break;
+    case InputMode::PRED_MODE:
+        // 先定位聯想視窗（依滑鼠或使用者位置），再讓字碼視窗貼在其上方，
+        // 確保 hInputWnd 與 hPredWnd 始終成對，不會分離。
+        positionPredictionWindow(state);
         positionInputWindow(state);
-    } else {
-        // 沒有候選字時，也要定位字碼視窗
-        positionInputWindow(state);
+        break;
+    case InputMode::IDLE:
+    default:
+        // 空閒模式不需特別定位
+        break;
     }
 }
 
 void positionMainWindow(GlobalState& state) {
-    // 主視窗位置
-    SetWindowPos(state.hWnd, NULL, 
-                PositionManager::g_toolbarPos.x, 
-                PositionManager::g_toolbarPos.y,
-                state.windowWidth, state.windowHeight,
-                SWP_NOZORDER);
+    // OptimizedUI 主視窗實際為工具列 290x35，勿用 config 的 580x70 以免被放大、右側空白且易被工作列遮蓋
+    int w = state.windowWidth;
+    int h = state.windowHeight;
+    if (state.useOptimizedUI) {
+        w = TOOLBAR_WIDTH;
+        h = TOOLBAR_HEIGHT;
+    }
+    
+    // 以「目前工具列位置所在螢幕」的工作區做邊界，避免接上副螢幕時被當成越界而推到主螢幕邊緣
+    POINT toolbarPt = { PositionManager::g_toolbarPos.x, PositionManager::g_toolbarPos.y };
+    RECT workArea = ScreenManager::getMonitorFromPoint(toolbarPt).workArea;
+    int x = PositionManager::g_toolbarPos.x;
+    int y = PositionManager::g_toolbarPos.y;
+    const int margin = 5;
+    
+    if (x + w > workArea.right - margin)
+        x = workArea.right - w - margin;
+    if (x < workArea.left + margin)
+        x = workArea.left + margin;
+    if (y + h > workArea.bottom - margin)
+        y = workArea.bottom - h - margin;
+    if (y < workArea.top + margin)
+        y = workArea.top + margin;
+    
+    PositionManager::g_toolbarPos.x = x;
+    PositionManager::g_toolbarPos.y = y;
+    
+    SetWindowPos(state.hWnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
 }
 
 // 注意：传统UI按钮检测函数（isPointInCloseButton, isPointInModeButton, 
@@ -416,8 +757,14 @@ bool isPointInNextPageButton(int x, int y, const GlobalState& state) {
 LRESULT handleKeyboardInput(HWND hwnd, WPARAM wp) {
     DWORD key = (DWORD)wp;
     if (g_state.chineseMode) {
-        if (key == 'U' || key == 'I' || key == 'O' || key == 'J' || key == 'K' || key == 'L' || key == 'P' ||
-            key == VK_NUMPAD7 || key == VK_NUMPAD8 || key == VK_NUMPAD9 || key == VK_NUMPAD4 || key == VK_NUMPAD5 || key == VK_NUMPAD0) {
+        // 筆劃鍵與萬用字元 * 按鍵（3+3 用，Wildcard 鍵可在 [InputSettings] 中自訂）
+        bool isStrokeOrWildcardKey =
+            key == 'U' || key == 'I' || key == 'O' || key == 'J' || key == 'K' || key == 'P' ||
+            key == VK_NUMPAD7 || key == VK_NUMPAD8 || key == VK_NUMPAD9 ||
+            key == VK_NUMPAD4 || key == VK_NUMPAD5 ||
+            key == static_cast<DWORD>(g_state.wildcardKey1VK) ||
+            key == static_cast<DWORD>(g_state.wildcardKey2VK);
+        if (isStrokeOrWildcardKey) {
             InputHandler::processStroke(g_state, key);
             return 0;
         }
@@ -428,8 +775,21 @@ LRESULT handleKeyboardInput(HWND hwnd, WPARAM wp) {
             (key == '3' && (GetKeyState(VK_SHIFT) & 0x8000)) || (key == '4' && (GetKeyState(VK_SHIFT) & 0x8000)) ||
             (key == '5' && (GetKeyState(VK_SHIFT) & 0x8000)) || (key == '6' && (GetKeyState(VK_SHIFT) & 0x8000)) ||
             (key == '7' && (GetKeyState(VK_SHIFT) & 0x8000)) || (key == '8' && (GetKeyState(VK_SHIFT) & 0x8000)) ||
-            (key == '9' && (GetKeyState(VK_SHIFT) & 0x8000)) || (key == '0' && (GetKeyState(VK_SHIFT) & 0x8000))) {
+            (key == '9' && (GetKeyState(VK_SHIFT) & 0x8000)) || (key == '0' && (GetKeyState(VK_SHIFT) & 0x8000)) ||
+            key == VK_MULTIPLY || key == VK_ADD || key == VK_SUBTRACT || key == VK_DECIMAL || key == VK_DIVIDE) {
             InputHandler::processPunctuator(g_state, key);
+            // 中文模式下輸入標點符號後清空視窗（與按 ESC 效果一致）
+            g_state.input.clear();
+            g_state.candidates.clear();
+            g_state.candidateCodes.clear();
+            g_state.showCand = false;
+            g_state.isInputting = false;
+            g_state.inputError = false;
+            g_state.showPunctMenu = false;
+            if (g_state.hCandWnd) ShowWindow(g_state.hCandWnd, SW_HIDE);
+            if (g_state.hPredWnd) ShowWindow(g_state.hPredWnd, SW_HIDE);
+            if (g_state.hInputWnd) ShowWindow(g_state.hInputWnd, SW_HIDE);
+            InvalidateRect(hwnd, nullptr, TRUE);
             return 0;
         }
     }
@@ -457,6 +817,7 @@ LRESULT handleKeyboardInput(HWND hwnd, WPARAM wp) {
         g_state.inputError = false;
         g_state.showPunctMenu = false;
         if (g_state.hCandWnd) ShowWindow(g_state.hCandWnd, SW_HIDE);
+        if (g_state.hPredWnd) ShowWindow(g_state.hPredWnd, SW_HIDE);
         if (g_state.hInputWnd) ShowWindow(g_state.hInputWnd, SW_HIDE);
         // 🔥 恢復 Windows 輸入法狀態（取消輸入後）
         IMEManager::restoreWindowsIME();
@@ -478,7 +839,7 @@ LRESULT handleCommand(HWND hwnd, WPARAM wp) {
     switch (LOWORD(wp)) {
         case 1001: InputHandler::showPunctMenu(g_state); break;
         case 1002: 
-            Dictionary::loadMainDict("Zi-Ma-Biao.txt", g_state);
+            Dictionary::loadMainDict(g_state);
             Utils::updateStatus(g_state, L"字碼表已重新載入");
             break;
         case 1003:
@@ -490,15 +851,16 @@ LRESULT handleCommand(HWND hwnd, WPARAM wp) {
             break;
         case 1008: // 從GitHub更新字碼表
         {
-            // 檢查是否存在現有字碼表文件
-            std::ifstream checkFile("Zi-Ma-Biao.txt");
+            // 檢查是否存在現有字碼表文件（system/ 目錄）
+            std::string dictPath = Utils::wstrToUtf8(g_state.systemDir + L"Zi-Ma-Biao.txt");
+            std::ifstream checkFile(dictPath);
             bool fileExists = checkFile.is_open();
             checkFile.close();
             
             // 如果文件存在，顯示確認對話框
             if (fileExists) {
                 std::wstring confirmMsg = L"確定要從 GitHub 下載字碼表嗎？\n\n";
-                confirmMsg += L"注意：下載會覆蓋現有的 Zi-Ma-Biao.txt 文件\n\n";
+                confirmMsg += L"注意：下載會覆蓋 system 目錄內的 Zi-Ma-Biao.txt\n\n";
                 confirmMsg += L"如果您已自定義過字碼表，請先自行備份原文件\n\n";
                 confirmMsg += L"點擊「是」開始下載更新，點擊「否」取消操作";
                 
@@ -537,6 +899,71 @@ LRESULT handleCommand(HWND hwnd, WPARAM wp) {
                 L"聯想字功能已開啟" : L"聯想字功能已關閉");
             break;
         }
+        case 1011: {
+            // 切換筆劃符號顯示（輸入框顯示一丨丿丶フ 或 uiojk）
+            g_state.showStrokeSymbols = !g_state.showStrokeSymbols;
+            ConfigLoader::saveInterfaceConfig(g_state);
+            Utils::updateStatus(g_state, g_state.showStrokeSymbols ? 
+                L"筆劃符號顯示已開啟" : L"筆劃符號顯示已關閉");
+            if (g_state.hInputWnd) InvalidateRect(g_state.hInputWnd, nullptr, TRUE);
+            break;
+        }
+        case 1101: // 候選右鍵：切換 pinned
+        case 1102: // 候選右鍵：切換 locked
+        case 1103: // 候選右鍵：刪除此聯想（可再次學回）
+        case 1104: { // 候選右鍵：永不再顯示 / 取消封鎖
+            int idx = g_state.contextMenuCandIndex;
+            if (idx < 0 || idx >= (int)g_state.candidates.size()) break;
+            if (g_state.lastSelected.empty()) break;
+            std::wstring prev = g_state.lastSelected;
+            std::wstring next = g_state.candidates[idx];
+            std::pair<std::wstring, std::wstring> key(prev, next);
+            
+            if (LOWORD(wp) == 1101) {
+                // pinned toggle
+                bool isPinned = g_state.pinnedContext.find(key) != g_state.pinnedContext.end();
+                Dictionary::setContextPinned(g_state, prev, next, !isPinned);
+            } else if (LOWORD(wp) == 1102) {
+                // locked toggle
+                bool isLocked = g_state.lockedContext.find(key) != g_state.lockedContext.end();
+                Dictionary::setContextLocked(g_state, prev, next, !isLocked);
+            } else if (LOWORD(wp) == 1103) {
+                // 刪除此聯想：從 contextLearning 及 locked/pinned 中移除
+                auto itPrev = g_state.contextLearning.find(prev);
+                if (itPrev != g_state.contextLearning.end()) {
+                    itPrev->second.erase(next);
+                    if (itPrev->second.empty()) {
+                        g_state.contextLearning.erase(itPrev);
+                    }
+                }
+                g_state.lockedContext.erase(key);
+                g_state.pinnedContext.erase(key);
+            } else if (LOWORD(wp) == 1104) {
+                // 永不再顯示：加入或移除 blockedContext
+                auto it = g_state.blockedContext.find(key);
+                if (it == g_state.blockedContext.end()) {
+                    // 新增封鎖：也一併從學習/locked/pinned 中移除
+                    g_state.blockedContext.insert(key);
+                    auto itPrev = g_state.contextLearning.find(prev);
+                    if (itPrev != g_state.contextLearning.end()) {
+                        itPrev->second.erase(next);
+                        if (itPrev->second.empty()) {
+                            g_state.contextLearning.erase(itPrev);
+                        }
+                    }
+                    g_state.lockedContext.erase(key);
+                    g_state.pinnedContext.erase(key);
+                } else {
+                    // 取消封鎖
+                    g_state.blockedContext.erase(it);
+                }
+            }
+            
+            // 儲存並重新顯示該字的聯想
+            Dictionary::saveContextLearning(g_state);
+            Dictionary::showPredictionsAfterSelection(g_state, prev);
+            break;
+        }
         case 1009: {
             // 暫停/啟用輸入法功能（釋放/重新設置鍵盤鉤子）
             if (g_state.imePaused) {
@@ -563,7 +990,7 @@ LRESULT handleCommand(HWND hwnd, WPARAM wp) {
                         g_hKeyboardHook = NULL;
                         g_state.imePaused = true;
                         
-                        // 清空字碼視窗和候選字視窗的顯示
+                        // 清空字碼視窗和候選字/聯想字視窗的顯示
                         g_state.input.clear();
                         g_state.candidates.clear();
                         g_state.candidateCodes.clear();
@@ -574,6 +1001,7 @@ LRESULT handleCommand(HWND hwnd, WPARAM wp) {
                         g_state.selected = 0;
                         g_state.currentPage = 0;
                         if (g_state.hCandWnd) ShowWindow(g_state.hCandWnd, SW_HIDE);
+                        if (g_state.hPredWnd) ShowWindow(g_state.hPredWnd, SW_HIDE);
                         if (g_state.hInputWnd) ShowWindow(g_state.hInputWnd, SW_HIDE);
                         
                         Utils::updateStatus(g_state, L"輸入法已暫停，鍵盤鉤子已釋放，按鍵回復正常");
@@ -585,7 +1013,7 @@ LRESULT handleCommand(HWND hwnd, WPARAM wp) {
                     // 鉤子不存在，直接更新狀態
                     g_state.imePaused = true;
                     
-                    // 清空字碼視窗和候選字視窗的顯示
+                    // 清空字碼視窗和候選字/聯想字視窗的顯示
                     g_state.input.clear();
                     g_state.candidates.clear();
                     g_state.candidateCodes.clear();
@@ -596,6 +1024,7 @@ LRESULT handleCommand(HWND hwnd, WPARAM wp) {
                     g_state.selected = 0;
                     g_state.currentPage = 0;
                     if (g_state.hCandWnd) ShowWindow(g_state.hCandWnd, SW_HIDE);
+                    if (g_state.hPredWnd) ShowWindow(g_state.hPredWnd, SW_HIDE);
                     if (g_state.hInputWnd) ShowWindow(g_state.hInputWnd, SW_HIDE);
                     
                     Utils::updateStatus(g_state, L"輸入法已暫停");
@@ -629,15 +1058,16 @@ LRESULT handleCommand(HWND hwnd, WPARAM wp) {
             break;
         case 2013: // 從GitHub更新字碼表
         {
-            // 檢查是否存在現有字碼表文件
-            std::ifstream checkFile("Zi-Ma-Biao.txt");
+            // 檢查是否存在現有字碼表文件（system/ 目錄）
+            std::string dictPath = Utils::wstrToUtf8(g_state.systemDir + L"Zi-Ma-Biao.txt");
+            std::ifstream checkFile(dictPath);
             bool fileExists = checkFile.is_open();
             checkFile.close();
             
             // 如果文件存在，顯示確認對話框
             if (fileExists) {
                 std::wstring confirmMsg = L"確定要從 GitHub 下載字碼表嗎？\n\n";
-                confirmMsg += L"⚠️ 注意：下載會覆蓋現有的 Zi-Ma-Biao.txt 文件\n\n";
+                confirmMsg += L"⚠️ 注意：下載會覆蓋 system 目錄內的 Zi-Ma-Biao.txt\n\n";
                 confirmMsg += L"如果您已自定義過字碼表，請先自行備份原文件\n\n";
                 confirmMsg += L"點擊「是」開始下載更新，點擊「否」取消操作";
                 
@@ -716,16 +1146,22 @@ LRESULT handleWindowDestroy(HWND hwnd) {
         DestroyWindow(g_state.hCandWnd);
         g_state.hCandWnd = NULL;
     }
+    if (g_state.hPredWnd) {
+        DestroyWindow(g_state.hPredWnd);
+        g_state.hPredWnd = NULL;
+    }
     if (g_state.hBufferWnd) {
         DestroyWindow(g_state.hBufferWnd);
         g_state.hBufferWnd = NULL;
     }
     
     // 定時器清理
+    KillTimer(hwnd, DEFERRED_INVALIDATE_TIMER_ID);
     KillTimer(hwnd, 999);
     
     // 儲存用戶設定
     Dictionary::saveUserDict(g_state);
+    Dictionary::saveContextLearning(g_state);  // 儲存智能聯想引擎的個人上下文學習記錄
     PositionManager::savePositions(g_state);
     
     // 移除系統托盤圖示
@@ -746,7 +1182,17 @@ LRESULT CALLBACK CandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_PAINT: { 
             PAINTSTRUCT ps; 
             HDC hdc = BeginPaint(hwnd, &ps); 
-            drawCandidate(hwnd, hdc, g_state); 
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            // 進階優化：雙緩衝繪製，減少閃爍
+            HDC memDC = CreateCompatibleDC(hdc);
+            HBITMAP memBitmap = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+            HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
+            drawCandidate(hwnd, memDC, g_state); 
+            BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
+            SelectObject(memDC, oldBitmap);
+            DeleteObject(memBitmap);
+            DeleteDC(memDC);
             EndPaint(hwnd, &ps); 
             return 0; 
         }
@@ -768,87 +1214,214 @@ LRESULT CALLBACK CandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
             }
             
-            // OptimizedUI模式：如果點擊不在翻頁按鈕上，則開始拖曳候選字視窗
+            // OptimizedUI 模式：從候選字視窗拖曳整塊（錨點為候選視窗上的點擊處）
             if (g_state.useOptimizedUI) {
                 g_state.dragState.isCandDragging = true;
                 SetCapture(hwnd);
-                
                 POINT pt;
                 GetCursorPos(&pt);
-                
-                // 記錄相對於字碼輸入視窗的偏移量
-                if (g_state.hInputWnd) {
-                    RECT inputRect;
-                    GetWindowRect(g_state.hInputWnd, &inputRect);
-                    g_state.dragState.dragOffset.x = pt.x - inputRect.left;
-                    g_state.dragState.dragOffset.y = pt.y - inputRect.top;
-                }
+                RECT candRect;
+                GetWindowRect(hwnd, &candRect);
+                g_state.dragState.dragOffset.x = pt.x - candRect.left;
+                g_state.dragState.dragOffset.y = pt.y - candRect.top;
             }
-            
             return 0; 
         }
         
-        case WM_MOUSEMOVE: {
+        case WM_RBUTTONDOWN: {
+            // 在候選列表上顯示 pinned / locked / del / block 右鍵選單
+            if (!g_state.showCand || g_state.candidates.empty()) return 0;
+            
             int x = LOWORD(lp);
             int y = HIWORD(lp);
             
-            // 處理翻頁按鈕懸停效果
-            bool needRedraw = false;
+            RECT rc;
+            GetClientRect(hwnd, &rc);
             
-            if (g_state.totalPages > 1) {
-                bool newPrevHover = isPointInPrevPageButton(x, y, g_state) && g_state.currentPage > 0;
-                bool newNextHover = isPointInNextPageButton(x, y, g_state) && g_state.currentPage < g_state.totalPages - 1;
-                
-                if (newPrevHover != g_state.prevPageButtonHover || newNextHover != g_state.nextPageButtonHover) {
-                    needRedraw = true;
-                }
-                
-                g_state.prevPageButtonHover = newPrevHover;
-                g_state.nextPageButtonHover = newNextHover;
-                
-                if (needRedraw) {
-                    InvalidateRect(hwnd, nullptr, TRUE);
-                }
+            int lineHeight = g_state.candidateFontSize + 6;
+            int startIndex = g_state.currentPage * CANDIDATES_PER_PAGE;
+            int endIndex = std::min(startIndex + CANDIDATES_PER_PAGE, (int)g_state.candidates.size());
+            int countThisPage = endIndex - startIndex;
+            
+            // 候選列 Y 範圍大約從 8 開始（與 drawCandidate 保持一致）
+            if (y < 8) return 0;
+            int row = (y - 8) / lineHeight;
+            if (row < 0 || row >= countThisPage) return 0;
+            
+            int actualIndex = startIndex + row;
+            if (actualIndex < 0 || actualIndex >= (int)g_state.candidates.size()) return 0;
+            
+            g_state.contextMenuCandIndex = actualIndex;
+            
+            HMENU hMenu = CreatePopupMenu();
+            
+            // 依當前狀態動態決定 pinned / locked / block 文案
+            std::wstring prev = g_state.lastSelected;
+            std::wstring next = g_state.candidates[actualIndex];
+            std::pair<std::wstring, std::wstring> key(prev, next);
+            bool isPinned = g_state.pinnedContext.find(key) != g_state.pinnedContext.end();
+            bool isLocked = g_state.lockedContext.find(key) != g_state.lockedContext.end();
+            bool isBlocked = g_state.blockedContext.find(key) != g_state.blockedContext.end();
+
+            // 在選單上方顯示目前設定的聯想對象提示：「設定聯想：prev → next」
+            std::wstring headerText = L"設定聯想：" + prev + L" → " + next;
+            AppendMenuW(hMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, headerText.c_str());
+            AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+            
+            AppendMenuW(hMenu, MF_STRING, 1101,
+                isPinned ? L"取消置頂 (unpin)" : L"⚐ 設為置頂 (pinned)");
+            AppendMenuW(hMenu, MF_STRING, 1102,
+                isLocked ? L"取消鎖定 (unlock)" : L"⚑ 設為鎖定 (locked)");
+            AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+            AppendMenuW(hMenu, MF_STRING, 1103, L"刪除此聯想（可再次學回）");
+            AppendMenuW(hMenu, MF_STRING, 1104,
+                isBlocked ? L"取消永不再顯示" : L"永不再顯示此聯想");
+            
+            POINT pt = { x, y };
+            ClientToScreen(hwnd, &pt);
+            
+            // 顯示選單期間標記 menuShowing，讓鍵盤鉤子放行 ESC 給選單處理
+            g_state.menuShowing = true;
+
+            // 設置候選視窗為前台，確保鍵盤事件（包含 ESC）送到選單
+            SetForegroundWindow(hwnd);
+            MSG msg;
+            for (int i = 0; i < 15; ++i) {
+                if (!PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) break;
+                if (msg.message == WM_QUIT) break;
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
             }
+
+            int cmd = TrackPopupMenuEx(
+                hMenu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_VERTICAL,
+                pt.x, pt.y,
+                hwnd,
+                nullptr
+            );
+            DestroyMenu(hMenu);
+
+            g_state.menuShowing = false;
+
+            // 發送空消息穩定焦點狀態
+            PostMessage(hwnd, WM_NULL, 0, 0);
             
-            // OptimizedUI模式：處理拖拽邏輯
+            if (cmd >= 1101 && cmd <= 1104 && g_state.hWnd) {
+                PostMessageW(g_state.hWnd, WM_COMMAND, cmd, 0);
+            }
+            return 0;
+        }
+        
+        case WM_MOUSEMOVE: {
+            // OptimizedUI 模式：拖曳時只處理位移，不更新 hover 以減少遲緩
             if (g_state.useOptimizedUI && g_state.dragState.isCandDragging) {
                 POINT pt;
                 GetCursorPos(&pt);
+                int newCandX = pt.x - g_state.dragState.dragOffset.x;
+                int newCandY = pt.y - g_state.dragState.dragOffset.y;
                 
-                // 移動字碼輸入視窗
+                RECT candRect;
+                GetWindowRect(hwnd, &candRect);
+                int candWidth = candRect.right - candRect.left;
+                int candHeight = candRect.bottom - candRect.top;
+                
+                RECT workArea = ScreenManager::getMonitorFromPoint(pt).workArea;
+                int margin = 4;
+                if (newCandX < workArea.left + margin) newCandX = workArea.left + margin;
+                if (newCandY < workArea.top + margin) newCandY = workArea.top + margin;
+                if (newCandX + candWidth > workArea.right - margin) newCandX = workArea.right - margin - candWidth;
+                if (newCandY + candHeight > workArea.bottom - margin) newCandY = workArea.bottom - margin - candHeight;
+                
+                if (!g_state.menuShowing) {
+                    SetWindowPos(hwnd, HWND_TOPMOST,
+                                newCandX, newCandY, candWidth, candHeight,
+                                SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                } else {
+                    SetWindowPos(hwnd, HWND_NOTOPMOST,
+                                newCandX, newCandY, candWidth, candHeight,
+                                SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                }
+                
                 if (g_state.hInputWnd) {
-                    int newX = pt.x - g_state.dragState.dragOffset.x;
-                    int newY = pt.y - g_state.dragState.dragOffset.y;
-                    
+                    int inputY = newCandY - INPUT_WINDOW_HEIGHT - WINDOW_SPACING;
                     RECT inputRect;
                     GetWindowRect(g_state.hInputWnd, &inputRect);
                     int inputWidth = inputRect.right - inputRect.left;
-                    
-                    // 移動字碼輸入視窗（只有在菜單未顯示時才設置TOPMOST）
                     if (!g_state.menuShowing) {
                         SetWindowPos(g_state.hInputWnd, HWND_TOPMOST,
-                                    newX, newY, inputWidth, INPUT_WINDOW_HEIGHT,
+                                    newCandX, inputY, inputWidth, INPUT_WINDOW_HEIGHT,
                                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
                     } else {
                         SetWindowPos(g_state.hInputWnd, HWND_NOTOPMOST,
-                                    newX, newY, inputWidth, INPUT_WINDOW_HEIGHT,
-                                    SWP_NOACTIVATE | SWP_SHOWWINDOW);
-                    }
-                    
-                    // 候選字視窗自動跟隨在字碼視窗下方（只有在菜單未顯示時才設置TOPMOST）
-                    if (g_state.hCandWnd && g_state.showCand && !g_state.menuShowing) {
-                        RECT candRect;
-                        GetWindowRect(hwnd, &candRect);
-                        int candWidth = candRect.right - candRect.left;
-                        int candHeight = candRect.bottom - candRect.top;
-                        
-                        SetWindowPos(hwnd, HWND_TOPMOST,
-                                    newX, newY + INPUT_WINDOW_HEIGHT + WINDOW_SPACING,
-                                    candWidth, candHeight,
+                                    newCandX, inputY, inputWidth, INPUT_WINDOW_HEIGHT,
                                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
                     }
                 }
+                
+                if (g_state.hPredWnd && IsWindowVisible(g_state.hPredWnd) && g_state.enableWordPrediction) {
+                    RECT predRect;
+                    GetWindowRect(g_state.hPredWnd, &predRect);
+                    int predWidth  = predRect.right  - predRect.left;
+                    int predHeight = predRect.bottom - predRect.top;
+                    int predY = newCandY + candHeight + WINDOW_SPACING;
+                    SetWindowPos(g_state.hPredWnd,
+                                g_state.menuShowing ? HWND_NOTOPMOST : HWND_TOPMOST,
+                                newCandX, predY, predWidth, predHeight,
+                                SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                }
+                return 0;
+            }
+            
+            int x = LOWORD(lp);
+            int y = HIWORD(lp);
+            bool ctrlPressed = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            bool needRedraw = false;
+            
+            if (ctrlPressed) {
+                // 處理翻頁按鈕懸停效果（僅在按住 Ctrl 時）
+                if (g_state.totalPages > 1) {
+                    bool newPrevHover = isPointInPrevPageButton(x, y, g_state) && g_state.currentPage > 0;
+                    bool newNextHover = isPointInNextPageButton(x, y, g_state) && g_state.currentPage < g_state.totalPages - 1;
+                    
+                    if (newPrevHover != g_state.prevPageButtonHover || newNextHover != g_state.nextPageButtonHover) {
+                        needRedraw = true;
+                    }
+                    
+                    g_state.prevPageButtonHover = newPrevHover;
+                    g_state.nextPageButtonHover = newNextHover;
+                }
+                
+                // 更新候選 hover 行（僅在有候選且非拖曳時，且按住 Ctrl）
+                if (g_state.showCand && !g_state.candidates.empty()) {
+                    int lineHeight = g_state.candidateFontSize + 6;
+                    int startIndex = g_state.currentPage * CANDIDATES_PER_PAGE;
+                    int endIndex = std::min(startIndex + CANDIDATES_PER_PAGE, (int)g_state.candidates.size());
+                    int countThisPage = endIndex - startIndex;
+                    int newHoverIndex = -1;
+                    if (y >= 8) {
+                        int row = (y - 8) / lineHeight;
+                        if (row >= 0 && row < countThisPage) {
+                            newHoverIndex = startIndex + row;
+                        }
+                    }
+                    if (newHoverIndex != g_state.hoverCandidateIndex) {
+                        g_state.hoverCandidateIndex = newHoverIndex;
+                        needRedraw = true;
+                    }
+                }
+            } else {
+                // 未按 Ctrl 時清除候選視窗的 hover 狀態
+                if (g_state.prevPageButtonHover || g_state.nextPageButtonHover || g_state.hoverCandidateIndex >= 0) {
+                    g_state.prevPageButtonHover = false;
+                    g_state.nextPageButtonHover = false;
+                    g_state.hoverCandidateIndex = -1;
+                    needRedraw = true;
+                }
+            }
+            
+            if (needRedraw) {
+                scheduleDeferredInvalidate(DEFERRED_CAND);
             }
             
             return 0;
@@ -873,6 +1446,270 @@ LRESULT CALLBACK CandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     Utils::updateStatus(g_state, L"已切換到使用者位置模式");
                 }
                 
+                return 0;
+            }
+            break;
+        }
+    }
+    
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+// 聯想字窗口過程（目前複製 CandProc，行為完全相同。
+// 後續步驟會逐步改為僅處理聯想字視窗邏輯。）
+LRESULT CALLBACK PredProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_ERASEBKGND:
+            return 1;
+            
+        case WM_PAINT: { 
+            PAINTSTRUCT ps; 
+            HDC hdc = BeginPaint(hwnd, &ps); 
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            // 進階優化：雙緩衝繪製，減少閃爍
+            HDC memDC = CreateCompatibleDC(hdc);
+            HBITMAP memBitmap = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+            HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
+            drawPrediction(hwnd, memDC, g_state); 
+            BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
+            SelectObject(memDC, oldBitmap);
+            DeleteObject(memBitmap);
+            DeleteDC(memDC);
+            EndPaint(hwnd, &ps); 
+            return 0; 
+        }
+            
+        case WM_LBUTTONDOWN: { 
+            int x = LOWORD(lp);
+            int y = HIWORD(lp);
+            
+            // ★ 只處理翻頁按鈕點擊（移除候選字點擊功能）
+            if (g_state.totalPages > 1) {
+                if (isPointInPrevPageButton(x, y, g_state) && g_state.currentPage > 0) {
+                    Dictionary::changePage(g_state, -1);
+                    return 0;
+                }
+                
+                if (isPointInNextPageButton(x, y, g_state) && g_state.currentPage < g_state.totalPages - 1) {
+                    Dictionary::changePage(g_state, 1);
+                    return 0;
+                }
+            }
+            
+            // OptimizedUI 模式：從聯想字視窗拖曳整塊（錨點為聯想視窗上的點擊處）
+            if (g_state.useOptimizedUI) {
+                g_state.dragState.isPredDragging = true;
+                SetCapture(hwnd);
+                
+                POINT pt;
+                GetCursorPos(&pt);
+                RECT predRect;
+                GetWindowRect(hwnd, &predRect);
+                g_state.dragState.dragOffset.x = pt.x - predRect.left;
+                g_state.dragState.dragOffset.y = pt.y - predRect.top;
+            }
+            
+            return 0; 
+        }
+        
+        case WM_RBUTTONDOWN: {
+            // 聯想字視窗右鍵選單：只在有候選且有 lastSelected 時才有意義
+            if (!g_state.showCand || g_state.candidates.empty()) return 0;
+            if (g_state.lastSelected.empty()) return 0;
+            
+            int x = LOWORD(lp);
+            int y = HIWORD(lp);
+            
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            
+            int lineHeight = g_state.candidateFontSize + 6;
+            int startIndex = g_state.currentPage * CANDIDATES_PER_PAGE;
+            int endIndex = std::min(startIndex + CANDIDATES_PER_PAGE, (int)g_state.candidates.size());
+            int countThisPage = endIndex - startIndex;
+            
+            if (y < 8) return 0;
+            int row = (y - 8) / lineHeight;
+            if (row < 0 || row >= countThisPage) return 0;
+            
+            int actualIndex = startIndex + row;
+            if (actualIndex < 0 || actualIndex >= (int)g_state.candidates.size()) return 0;
+            
+            g_state.contextMenuCandIndex = actualIndex;
+            
+            HMENU hMenu = CreatePopupMenu();
+            
+            std::wstring prev = g_state.lastSelected;
+            std::wstring next = g_state.candidates[actualIndex];
+            std::pair<std::wstring, std::wstring> key(prev, next);
+            bool isPinned  = g_state.pinnedContext.find(key)  != g_state.pinnedContext.end();
+            bool isLocked  = g_state.lockedContext.find(key)  != g_state.lockedContext.end();
+            bool isBlocked = g_state.blockedContext.find(key) != g_state.blockedContext.end();
+
+            // 在選單上方顯示目前設定的聯想對象提示：「設定聯想：prev → next」
+            std::wstring headerText = L"設定聯想：" + prev + L" → " + next;
+            AppendMenuW(hMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, headerText.c_str());
+            AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+            
+            AppendMenuW(hMenu, MF_STRING, 1101,
+                isPinned ? L"取消置頂 (unpin)" : L"⚐ 設為置頂 (pinned)");
+            AppendMenuW(hMenu, MF_STRING, 1102,
+                isLocked ? L"取消鎖定 (unlock)" : L"⚑ 設為鎖定 (locked)");
+            AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+            AppendMenuW(hMenu, MF_STRING, 1103, L"刪除此聯想（可再次學回）");
+            AppendMenuW(hMenu, MF_STRING, 1104,
+                isBlocked ? L"取消永不再顯示" : L"永不再顯示此聯想");
+            
+            POINT pt = { x, y };
+            ClientToScreen(hwnd, &pt);
+            
+            // 顯示選單期間暫時降為 NOTOPMOST，避免候選窗遮住選單
+            g_state.menuShowing = true;
+            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+            // 設置聯想視窗為前台，確保鍵盤事件（包含 ESC）送到選單
+            SetForegroundWindow(hwnd);
+            MSG msg;
+            for (int i = 0; i < 15; ++i) {
+                if (!PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) break;
+                if (msg.message == WM_QUIT) break;
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+            
+            int cmd = TrackPopupMenuEx(
+                hMenu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_VERTICAL,
+                pt.x, pt.y,
+                hwnd,
+                nullptr
+            );
+            DestroyMenu(hMenu);
+            
+            // 選單結束後恢復 TOPMOST 狀態
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            g_state.menuShowing = false;
+            
+            if (cmd >= 1101 && cmd <= 1104 && g_state.hWnd) {
+                PostMessageW(g_state.hWnd, WM_COMMAND, cmd, 0);
+            }
+            return 0;
+        }
+        
+        case WM_MOUSEMOVE: {
+            // 拖曳時只處理位移，不更新 hover 以減少遲緩
+            if (g_state.useOptimizedUI && g_state.dragState.isPredDragging) {
+                POINT pt;
+                GetCursorPos(&pt);
+                int newPredX = pt.x - g_state.dragState.dragOffset.x;
+                int newPredY = pt.y - g_state.dragState.dragOffset.y;
+                
+                RECT predRect;
+                GetWindowRect(hwnd, &predRect);
+                int predWidth  = predRect.right  - predRect.left;
+                int predHeight = predRect.bottom - predRect.top;
+                
+                RECT workArea = ScreenManager::getMonitorFromPoint(pt).workArea;
+                int margin = 4;
+                if (newPredX < workArea.left + margin) newPredX = workArea.left + margin;
+                if (newPredY < workArea.top + margin) newPredY = workArea.top + margin;
+                if (newPredX + predWidth > workArea.right - margin) newPredX = workArea.right - margin - predWidth;
+                if (newPredY + predHeight > workArea.bottom - margin) newPredY = workArea.bottom - margin - predHeight;
+                
+                if (!g_state.menuShowing) {
+                    SetWindowPos(hwnd, HWND_TOPMOST,
+                                newPredX, newPredY, predWidth, predHeight,
+                                SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                } else {
+                    SetWindowPos(hwnd, HWND_NOTOPMOST,
+                                newPredX, newPredY, predWidth, predHeight,
+                                SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                }
+                
+                int candHeight = 0;
+                if (g_state.hCandWnd && IsWindowVisible(g_state.hCandWnd)) {
+                    RECT cr;
+                    GetWindowRect(g_state.hCandWnd, &cr);
+                    candHeight = cr.bottom - cr.top;
+                }
+                int candY = (candHeight > 0) ? (newPredY - candHeight - WINDOW_SPACING) : 0;
+                int inputY = (candHeight > 0) ? (candY - INPUT_WINDOW_HEIGHT - WINDOW_SPACING) : (newPredY - INPUT_WINDOW_HEIGHT - WINDOW_SPACING);
+                
+                if (g_state.hInputWnd) {
+                    RECT inputRect;
+                    GetWindowRect(g_state.hInputWnd, &inputRect);
+                    int inputWidth = inputRect.right - inputRect.left;
+                    if (!g_state.menuShowing) {
+                        SetWindowPos(g_state.hInputWnd, HWND_TOPMOST,
+                                    newPredX, inputY, inputWidth, INPUT_WINDOW_HEIGHT,
+                                    SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                    } else {
+                        SetWindowPos(g_state.hInputWnd, HWND_NOTOPMOST,
+                                    newPredX, inputY, inputWidth, INPUT_WINDOW_HEIGHT,
+                                    SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                    }
+                }
+                if (g_state.hCandWnd && g_state.showCand && candHeight > 0 && !g_state.menuShowing) {
+                    RECT candRect;
+                    GetWindowRect(g_state.hCandWnd, &candRect);
+                    int candWidth = candRect.right - candRect.left;
+                    SetWindowPos(g_state.hCandWnd, HWND_TOPMOST,
+                                newPredX, candY, candWidth, candHeight,
+                                SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                }
+                return 0;
+            }
+            
+            int y = HIWORD(lp);
+            bool ctrlPressed = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            
+            if (ctrlPressed) {
+                // Hover 高亮聯想候選（僅在按住 Ctrl 時）
+                if (g_state.showCand && !g_state.candidates.empty()) {
+                    int lineHeight   = g_state.candidateFontSize + 6;
+                    int startIndex   = g_state.currentPage * CANDIDATES_PER_PAGE;
+                    int endIndex     = std::min(startIndex + CANDIDATES_PER_PAGE,
+                                                (int)g_state.candidates.size());
+                    int countThisPage = endIndex - startIndex;
+                    int newHoverIndex = -1;
+                    if (y >= 8) {
+                        int row = (y - 8) / lineHeight;
+                        if (row >= 0 && row < countThisPage) {
+                            newHoverIndex = startIndex + row;
+                        }
+                    }
+                    if (newHoverIndex != g_state.hoverCandidateIndex) {
+                        g_state.hoverCandidateIndex = newHoverIndex;
+                        scheduleDeferredInvalidate(DEFERRED_PRED);
+                    }
+                }
+            } else {
+                if (g_state.hoverCandidateIndex >= 0) {
+                    g_state.hoverCandidateIndex = -1;
+                    scheduleDeferredInvalidate(DEFERRED_PRED);
+                }
+            }
+            
+            return 0;
+        }
+        
+        case WM_LBUTTONUP: {
+            if (g_state.useOptimizedUI && g_state.dragState.isPredDragging) {
+                g_state.dragState.isPredDragging = false;
+                ReleaseCapture();
+                if (g_state.hInputWnd) {
+                    RECT inputRect;
+                    GetWindowRect(g_state.hInputWnd, &inputRect);
+                    PositionManager::g_userCandPos.x = inputRect.left;
+                    PositionManager::g_userCandPos.y = inputRect.top;
+                    PositionManager::g_userCandPos.isValid = true;
+                    PositionManager::g_useUserPosition = true;
+                    PositionManager::savePositions(g_state);
+                    Utils::updateStatus(g_state, L"已切換到使用者位置模式");
+                }
                 return 0;
             }
             break;
@@ -1269,8 +2106,6 @@ LRESULT CALLBACK BufferProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     g_state.sendButtonHover = isPointInSendButton(x, y, g_state);
     g_state.clearButtonHover = isPointInClearButton(x, y, g_state);
     g_state.saveButtonHover = isPointInSaveButton(x, y, g_state);
-    
-    // 圓形按鈕懸停檢測
     int clipBtnCenterX = (g_state.clipboardModeButtonRect.left + g_state.clipboardModeButtonRect.right) / 2;
     int clipBtnCenterY = (g_state.clipboardModeButtonRect.top + g_state.clipboardModeButtonRect.bottom) / 2;
     int clipBtnRadius = (g_state.clipboardModeButtonRect.right - g_state.clipboardModeButtonRect.left) / 2;
@@ -1278,17 +2113,15 @@ LRESULT CALLBACK BufferProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     int dy = y - clipBtnCenterY;
     g_state.clipboardModeButtonHover = (dx * dx + dy * dy <= clipBtnRadius * clipBtnRadius);
     
-    
     if (g_state.isSelecting) {
         BufferManager::updateSelection(g_state, x, y);
     }
-    
     
     if (wasSendHover != g_state.sendButtonHover || 
         wasClearHover != g_state.clearButtonHover || 
         wasSaveHover != g_state.saveButtonHover ||
         wasClipboardModeHover != g_state.clipboardModeButtonHover) {
-        InvalidateRect(hwnd, nullptr, TRUE);
+        scheduleDeferredInvalidate(DEFERRED_BUFFER);
     }
     return 0;
 }
@@ -1339,17 +2172,24 @@ case WM_RBUTTONDOWN: {
     
     // 設置窗口為前台窗口
     SetForegroundWindow(hwnd);
+    // 讓系統完成前景切換與重繪，避免選單初次顯示白屏
+    MSG msg;
+    for (int i = 0; i < 15; ++i) {
+        if (!PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) break;
+        if (msg.message == WM_QUIT) break;
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
     
-    // 使用TrackPopupMenuEx來更好地控制選單位置和顯示
+    // 使用TrackPopupMenuEx（TPM_NOANIMATION 避免動畫導致初次不繪製）
     TPMPARAMS tpmParams = {0};
     tpmParams.cbSize = sizeof(TPMPARAMS);
-    // 設置選單顯示區域，確保選單不會被窗口邊緣遮擋
     tpmParams.rcExclude.left = pt.x - 1;
     tpmParams.rcExclude.top = pt.y - 1;
     tpmParams.rcExclude.right = pt.x + 1;
     tpmParams.rcExclude.bottom = pt.y + 1;
     
-    int cmd = TrackPopupMenuEx(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_VERTICAL,
+    int cmd = TrackPopupMenuEx(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_VERTICAL | TPM_NOANIMATION,
                               pt.x, pt.y, hwnd, &tpmParams);
     
     // 清除選單顯示標誌
@@ -1484,6 +2324,7 @@ case WM_KEYDOWN: {
                 // 延遲保存用戶字典（避免頻繁寫入文件）
                 KillTimer(hwnd, 999);
                 Dictionary::saveUserDict(g_state);
+                Dictionary::saveContextLearning(g_state);  // 儲存智能聯想引擎的個人上下文學習記錄
                 return 0;
             }
             if (wp == 1) {
@@ -1705,7 +2546,7 @@ void updateOptimizedButtonHover(int x, int y, GlobalState& state) {
     state.toolbarElements.closeButtonHover = newCloseHover;
     
     if (needRedraw && state.hWnd) {
-        InvalidateRect(state.hWnd, nullptr, TRUE);
+        scheduleDeferredInvalidate(DEFERRED_MAIN);
     }
 }
 
@@ -1804,7 +2645,7 @@ bool registerOptimizedWindowClasses(HINSTANCE hInstance) {
         return false;
     }
     
-    // 註冊候選視窗類別
+    // 註冊候選視窗類別（字碼候選字）
     WNDCLASSW wc2 = {0};
     wc2.lpfnWndProc = CandProc;  // 使用統一的候選字窗口過程
     wc2.hInstance = hInstance;
@@ -1812,6 +2653,17 @@ bool registerOptimizedWindowClasses(HINSTANCE hInstance) {
     wc2.hbrBackground = NULL;
     wc2.hCursor = LoadCursor(NULL, IDC_ARROW);
     if (!RegisterClassW(&wc2)) {
+        return false;
+    }
+    
+    // 註冊聯想字視窗類別（目前行為與 CandProc 相同，後續再微調）
+    WNDCLASSW wcPred = {0};
+    wcPred.lpfnWndProc = PredProc;
+    wcPred.hInstance = hInstance;
+    wcPred.lpszClassName = L"IMEPREDICT";
+    wcPred.hbrBackground = NULL;
+    wcPred.hCursor = LoadCursor(NULL, IDC_ARROW);
+    if (!RegisterClassW(&wcPred)) {
         return false;
     }
     
@@ -1884,9 +2736,15 @@ void drawInputWindow(HDC hdc, RECT rc, const GlobalState& state) {
     // 使用 getInputDisplay 來獲取包含3+3提示的顯示文字
     std::wstring displayText;
     if (state.input.empty()) {
-        // 如果正在顯示聯想字，提示用戶可以選擇聯想字或輸入筆劃代碼
+        // 如果正在顯示聯想字，依狀態提示用戶
         if (state.showCand && state.isInputting && state.enableWordPrediction) {
-            displayText = state.chineseMode ? L"請選擇聯想字或輸入筆劃代碼 (u i o j k l)" : L"English Input Mode";
+            if (state.lastSelected.empty()) {
+                // 尚未有前字：提示先輸入前字
+                displayText = state.chineseMode ? L"請先輸入前字，再選擇聯想字或輸入筆劃代碼 (u i o j k l)" : L"English Input Mode";
+            } else {
+                // 已有前字：提示可直接選擇聯想字或輸入筆劃
+                displayText = state.chineseMode ? L"請選擇聯想字或輸入筆劃代碼 (u i o j k l)" : L"English Input Mode";
+            }
         } else {
             displayText = state.chineseMode ? L"請輸入筆劃代碼 (u i o j k l)" : L"English Input Mode";
         }
@@ -1941,7 +2799,7 @@ bool createOptimizedWindows(HINSTANCE hInstance, GlobalState& state) {
     
     if (!state.hWnd) return false;
     
-    // 創建候選視窗
+    // 創建候選視窗（字碼候選字）
     state.hCandWnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW, 
         L"IME_CAND_OPTIMIZED", 
@@ -1952,6 +2810,20 @@ bool createOptimizedWindows(HINSTANCE hInstance, GlobalState& state) {
     );
     
     if (!state.hCandWnd) return false;
+    
+    // 創建聯想字視窗（目前預設隱藏，後續步驟再使用）
+    state.hPredWnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        L"IMEPREDICT",
+        L"",
+        WS_POPUP | WS_BORDER,
+        100, 220,
+        state.candidateWidth,
+        state.candidateHeight,
+        NULL, NULL, hInstance, NULL
+    );
+    if (!state.hPredWnd) return false;
+    ShowWindow(state.hPredWnd, SW_HIDE);
     
     // 創建字碼輸入視窗
     if (!createInputWindow(hInstance, state)) {
@@ -1999,10 +2871,22 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }	
         
 		case WM_TIMER: {
+			// 進階優化：延遲重繪計時器（合併滑鼠 hover 觸發的重繪）
+			if (wp == DEFERRED_INVALIDATE_TIMER_ID) {
+				KillTimer(hwnd, DEFERRED_INVALIDATE_TIMER_ID);
+				g_deferredInvalidateScheduled = false;
+				if (g_deferredInvalidateFlags & DEFERRED_MAIN && g_state.hWnd) InvalidateRect(g_state.hWnd, nullptr, TRUE);
+				if (g_deferredInvalidateFlags & DEFERRED_CAND && g_state.hCandWnd) InvalidateRect(g_state.hCandWnd, nullptr, TRUE);
+				if (g_deferredInvalidateFlags & DEFERRED_PRED && g_state.hPredWnd) InvalidateRect(g_state.hPredWnd, nullptr, TRUE);
+				if (g_deferredInvalidateFlags & DEFERRED_BUFFER && g_state.hBufferWnd) InvalidateRect(g_state.hBufferWnd, nullptr, TRUE);
+				g_deferredInvalidateFlags = 0;
+				return 0;
+			}
 			if (wp == 995) {
 				// 延遲保存用戶字典（避免頻繁寫入文件，提升性能）
 				KillTimer(hwnd, 995);
 				Dictionary::saveUserDict(g_state);
+				Dictionary::saveContextLearning(g_state);  // 儲存智能聯想引擎的個人上下文學習記錄
 				return 0;
 			}
 			if (wp == 997) {
@@ -2011,6 +2895,10 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         
 				ScreenManager::handleDisplayChange();
 				PositionManager::adjustPositionForScreenMode(g_state);
+				// 重新定位所有輸入法視窗至工作區內（避免被工作列遮蓋）
+				ScreenManager::updateMonitorInfo();
+				WindowManager::positionMainWindow(g_state);
+				WindowManager::positionWindowsOptimized(g_state);
         
 				// 確保視窗可見
 				if (!IsWindowVisible(hwnd)) {
@@ -2035,14 +2923,21 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 				PositionManager::adjustPositionForScreenMode(g_state);
 				return 0;
 			}
+			else if (wp == 993) {
+				// 延遲恢復 TOPMOST（由 WM_USER+300 觸發），避免 Sleep 阻塞導致 toolbar 卡死
+				KillTimer(hwnd, 993);
+				SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+				            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+				return 0;
+			}
 			else if (wp == 994) {
 				// 啟動時自動檢查版本更新（僅在程序啟動時執行一次）
 				KillTimer(hwnd, 994);
 				
 				// 檢查版本（使用緩存，但如果緩存過期會自動從 GitHub 獲取）
-				// 注意：首次啟動或緩存過期（24小時）後會重新檢查
 				std::string currentVersion = APP_VERSION;
-				std::string remoteVersion = DictUpdater::getRemoteVersion();
+				std::string versionCachePath = Utils::wstrToUtf8(g_state.systemDir + L"version_cache.txt");
+				std::string remoteVersion = DictUpdater::getRemoteVersion(nullptr, false, 24, versionCachePath.c_str());
 				
 				// 如果發現新版本，顯示通知
 				if (!remoteVersion.empty() && remoteVersion != currentVersion) {
@@ -2086,9 +2981,51 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     return 0;
                 }
             
-                // 強制保持前置
+                // 強制保持前置（主工具列）
                 SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, 
                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                // 同步保持候選/聯想視窗前置（若可見且未在顯示選單）
+                if (g_state.hCandWnd && IsWindowVisible(g_state.hCandWnd)) {
+                    SetWindowPos(g_state.hCandWnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
+                if (g_state.hPredWnd && IsWindowVisible(g_state.hPredWnd)) {
+                    SetWindowPos(g_state.hPredWnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
+                
+                // 檢查並修正主視窗位置是否在工作區內（避免被工作列遮蓋）
+                RECT workArea = ScreenManager::getWorkArea(g_state.hWnd);
+                RECT currentRect;
+                GetWindowRect(g_state.hWnd, &currentRect);
+                bool needReposition = false;
+                int x = currentRect.left;
+                int y = currentRect.top;
+                int w = currentRect.right - currentRect.left;
+                int h = currentRect.bottom - currentRect.top;
+                const int margin = 5;
+                if (currentRect.right > workArea.right - margin) {
+                    x = workArea.right - w - margin;
+                    needReposition = true;
+                }
+                if (currentRect.bottom > workArea.bottom - margin) {
+                    y = workArea.bottom - h - margin;
+                    needReposition = true;
+                }
+                if (currentRect.left < workArea.left + margin) {
+                    x = workArea.left + margin;
+                    needReposition = true;
+                }
+                if (currentRect.top < workArea.top + margin) {
+                    y = workArea.top + margin;
+                    needReposition = true;
+                }
+                if (needReposition) {
+                    PositionManager::g_toolbarPos.x = x;
+                    PositionManager::g_toolbarPos.y = y;
+                    SetWindowPos(g_state.hWnd, HWND_TOPMOST, x, y, 0, 0,
+                                 SWP_NOSIZE | SWP_NOACTIVATE);
+                }
                 
                 // 同時確保其他關鍵視窗也保持前置
                 // 通過調整設置順序來控制Z-order：先設置暫放視窗，再設置字碼視窗和候選字視窗
@@ -2113,8 +3050,18 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
 		
-        case WM_DISPLAYCHANGE:
+		case WM_DISPLAYCHANGE:
+            ScreenManager::updateMonitorInfo();
+            positionMainWindow(g_state);
+            positionWindowsOptimized(g_state);
             return handleDisplayChange(hwnd);
+
+        case WM_SETTINGCHANGE:
+            // 工作列位置變更時，重新定位至工作區內
+            ScreenManager::updateMonitorInfo();
+            positionMainWindow(g_state);
+            positionWindowsOptimized(g_state);
+            return 0;
 
         // 注意：WM_USER + 500 已移除（自動檢查更新功能已禁用，避免 GitHub API 訪問次數限制）
 
@@ -2178,6 +3125,8 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 AppendMenu(hMenu, MF_STRING, 1007, transparencyText.c_str());
                 std::wstring predictionText = g_state.enableWordPrediction ? L"✓ 聯想字功能" : L"聯想字功能";
                 AppendMenu(hMenu, MF_STRING, 1010, predictionText.c_str());
+                std::wstring strokeSymbolText = g_state.showStrokeSymbols ? L"✓ 筆劃符號：開" : L"筆劃符號：關";
+                AppendMenu(hMenu, MF_STRING, 1011, strokeSymbolText.c_str());
                 AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
                 // 暫停/啟用輸入法功能
                 std::wstring pauseText = g_state.imePaused ? L"▶ 啟用輸入法" : L"❚❚ 暫停輸入法";
@@ -2201,8 +3150,16 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 
                 // 設置窗口為前台窗口
                 SetForegroundWindow(hwnd);
+                // 讓系統完成前景切換與重繪，避免選單初次顯示白屏（滑鼠移過才正常）
+                MSG msg;
+                for (int i = 0; i < 15; ++i) {
+                    if (!PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) break;
+                    if (msg.message == WM_QUIT) break;
+                    TranslateMessage(&msg);
+                    DispatchMessage(&msg);
+                }
                 
-                // 使用TrackPopupMenuEx來更好地控制選單位置和顯示
+                // 使用TrackPopupMenuEx來更好地控制選單位置和顯示（TPM_NOANIMATION 避免動畫導致初次不繪製）
                 TPMPARAMS tpmParams = {0};
                 tpmParams.cbSize = sizeof(TPMPARAMS);
                 tpmParams.rcExclude.left = pt.x - 1;
@@ -2210,7 +3167,7 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 tpmParams.rcExclude.right = pt.x + 1;
                 tpmParams.rcExclude.bottom = pt.y + 1;
                 
-                int cmd = TrackPopupMenuEx(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_VERTICAL,
+                int cmd = TrackPopupMenuEx(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_VERTICAL | TPM_NOANIMATION,
                                           pt.x, pt.y, hwnd, &tpmParams);
                 
                 // 清除選單顯示標誌
@@ -2243,7 +3200,7 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (isPointInOptimizedButton(x, y, g_state.toolbarElements.restoreButtonRect)) {
                 PositionManager::g_useUserPosition = false;
                 PositionManager::savePositions(g_state);
-                Utils::updateStatus(g_state, L"已恢復滑鼠跟隨模式");
+                // 僅切換為「跟隨滑鼠模式」，不立即移動現有視窗。
                 return 0;
             }
             
@@ -2277,8 +3234,6 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 int x = LOWORD(lp); 
                 int y = HIWORD(lp);
                 updateOptimizedButtonHover(x, y, g_state);
-                
-                // 追蹤鼠標離開事件，以便清除按鈕懸停狀態
                 TRACKMOUSEEVENT tme = {0};
                 tme.cbSize = sizeof(TRACKMOUSEEVENT);
                 tme.dwFlags = TME_LEAVE;
@@ -2317,7 +3272,7 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             
             if (needRedraw && g_state.hWnd) {
-                InvalidateRect(g_state.hWnd, nullptr, TRUE);
+                scheduleDeferredInvalidate(DEFERRED_MAIN);
             }
             return 0;
         }
@@ -2351,10 +3306,13 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return handleCommand(hwnd, wp);
         
         case WM_USER + 300: {
-            // 使用配置檔案中的延遲設定
-            Sleep(g_state.refocusDelay);
-            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            // 以計時器延遲執行，避免在訊息處理中 Sleep 導致 toolbar 卡死
+            if (g_state.refocusDelay <= 0) {
+                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            } else {
+                SetTimer(hwnd, 993, (UINT)g_state.refocusDelay, NULL);
+            }
             return 0;
         }
         
@@ -2420,6 +3378,13 @@ LRESULT CALLBACK InputProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 GetWindowRect(hwnd, &inputRect);
                 int inputWidth = inputRect.right - inputRect.left;
                 
+                RECT workArea = ScreenManager::getMonitorFromPoint(pt).workArea;
+                int margin = 4;
+                if (newX < workArea.left + margin) newX = workArea.left + margin;
+                if (newY < workArea.top + margin) newY = workArea.top + margin;
+                if (newX + inputWidth > workArea.right - margin) newX = workArea.right - margin - inputWidth;
+                if (newY + INPUT_WINDOW_HEIGHT > workArea.bottom - margin) newY = workArea.bottom - margin - INPUT_WINDOW_HEIGHT;
+                
                 // 移動字碼輸入視窗（只有在菜單未顯示時才設置TOPMOST）
                 if (!g_state.menuShowing) {
                     SetWindowPos(hwnd, HWND_TOPMOST,
@@ -2431,17 +3396,27 @@ LRESULT CALLBACK InputProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
                 }
                 
-                // 候選字視窗自動跟隨（只有在菜單未顯示時才設置TOPMOST）
-                if (g_state.hCandWnd && g_state.showCand && !g_state.menuShowing) {
-                    RECT candRect;
-                    GetWindowRect(g_state.hCandWnd, &candRect);
-                    int candWidth = candRect.right - candRect.left;
-                    int candHeight = candRect.bottom - candRect.top;
-                    
-                    SetWindowPos(g_state.hCandWnd, HWND_TOPMOST,
-                                newX, newY + INPUT_WINDOW_HEIGHT + WINDOW_SPACING,
-                                candWidth, candHeight,
-                                SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                // 僅在字碼候選模式時讓候選視窗跟隨；聯想模式時讓聯想視窗跟隨，避免誤顯示 hCandWnd
+                if (!g_state.menuShowing) {
+                    if (g_state.currentMode == InputMode::CAND_MODE && g_state.hCandWnd) {
+                        RECT candRect;
+                        GetWindowRect(g_state.hCandWnd, &candRect);
+                        int candWidth = candRect.right - candRect.left;
+                        int candHeight = candRect.bottom - candRect.top;
+                        SetWindowPos(g_state.hCandWnd, HWND_TOPMOST,
+                                    newX, newY + INPUT_WINDOW_HEIGHT + WINDOW_SPACING,
+                                    candWidth, candHeight,
+                                    SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                    } else if (g_state.currentMode == InputMode::PRED_MODE && g_state.hPredWnd) {
+                        RECT predRect;
+                        GetWindowRect(g_state.hPredWnd, &predRect);
+                        int predWidth = predRect.right - predRect.left;
+                        int predHeight = predRect.bottom - predRect.top;
+                        SetWindowPos(g_state.hPredWnd, HWND_TOPMOST,
+                                    newX, newY + INPUT_WINDOW_HEIGHT + WINDOW_SPACING,
+                                    predWidth, predHeight,
+                                    SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                    }
                 }
                 
                 return 0;
@@ -2472,64 +3447,77 @@ LRESULT CALLBACK InputProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProc(hwnd, msg, wp, lp);
 }
 
-// 修復：字碼輸入視窗位置調整
-void positionInputWindow(GlobalState& state) {
+// 優化跳動：字碼在列表上方/下方的切換滯後，避免邊界附近反覆切換
+static bool g_lastInputWasAboveList = true;
+const int PLACEMENT_HYSTERESIS = 15;
+
+// 修復：字碼輸入視窗位置調整（knownListRect 不為空時直接使用，避免 GetWindowRect 時序導致 listRectValid 搖擺）
+void positionInputWindow(GlobalState& state, const RECT* knownListRect) {
     if (!state.hInputWnd) {
-        return; // 如果視窗不存在就直接返回
+        return;
     }
     
-    // 關鍵修改：只要有輸入或正在顯示聯想字就顯示字碼視窗
-    // 聯想字模式下 state.input 可能為空，但 state.isInputting 和 state.showCand 為 true
     if (!state.isInputting || (state.input.empty() && !state.showCand)) {
         ShowWindow(state.hInputWnd, SW_HIDE);
         return;
     }
     
-    // 如果有候選字視窗且正在顯示候選字，字碼視窗定位在其上方
-    if (state.hCandWnd && state.showCand) {
-        // 確保候選字視窗已顯示
-        if (!IsWindowVisible(state.hCandWnd)) {
-            ShowWindow(state.hCandWnd, SW_SHOW);
+    HWND listWnd = NULL;
+    bool listRectValid = false;
+    RECT listRect = {};
+    
+    if (knownListRect && knownListRect->right > knownListRect->left && knownListRect->bottom > knownListRect->top) {
+        listRect = *knownListRect;
+        listRectValid = true;
+    }
+    if (!listRectValid) {
+        if (state.currentMode == InputMode::CAND_MODE && state.hCandWnd) {
+            listWnd = state.hCandWnd;
+            if (!IsWindowVisible(state.hCandWnd)) ShowWindow(state.hCandWnd, SW_SHOW);
+        } else if (state.currentMode == InputMode::PRED_MODE && state.hPredWnd) {
+            listWnd = state.hPredWnd;
+            if (!IsWindowVisible(state.hPredWnd)) ShowWindow(state.hPredWnd, SW_SHOW);
         }
-        
-        // 使用 UpdateWindow 和短暫延遲確保候選字視窗位置已完全更新
-        UpdateWindow(state.hCandWnd);
-        Sleep(10);  // 短暫延遲確保視窗位置已更新
-        
-        RECT candRect;
-        GetWindowRect(state.hCandWnd, &candRect);
-        
-        // 驗證獲取的位置是否有效（避免錯位）
-        if (candRect.left == 0 && candRect.top == 0 && 
-            (candRect.right == 0 || candRect.bottom == 0)) {
-            // 位置異常，重新獲取（可能是視窗剛創建）
-            Sleep(20);
-            GetWindowRect(state.hCandWnd, &candRect);
+        if (listWnd) {
+            UpdateWindow(listWnd);
+            GetWindowRect(listWnd, &listRect);
+            listRectValid = (listRect.right > listRect.left && listRect.bottom > listRect.top);
         }
-        
-        int inputWidth = candRect.right - candRect.left;
-        int inputX = candRect.left;
-        int inputY = candRect.top - INPUT_WINDOW_HEIGHT - 2;
-        
-        // 確保字碼視窗在螢幕可見範圍內
+    }
+    
+    if (listRectValid) {
+        int inputWidth = listRect.right - listRect.left;
+        int inputX = listRect.left;
+        const int inputListGap = 2;
+        int inputY = listRect.top - INPUT_WINDOW_HEIGHT - inputListGap;
         ScreenManager::MonitorInfo monitor = ScreenManager::getMonitorFromPoint({inputX, inputY});
-        if (inputY < monitor.workArea.top) {
-            inputY = candRect.bottom + 2; // 如果上方放不下，放到候選字視窗下方
+        int workTop = monitor.workArea.top;
+        // 滯後：僅在明顯超出上邊界時才切換到「字碼在列表下方」，避免邊界附近反覆上下跳
+        bool putInputBelow = false;
+        if (inputY < workTop - PLACEMENT_HYSTERESIS)
+            putInputBelow = true;
+        else if (inputY >= workTop)
+            putInputBelow = false;
+        else
+            putInputBelow = !g_lastInputWasAboveList;
+        if (putInputBelow) {
+            inputY = listRect.bottom + inputListGap;
+            g_lastInputWasAboveList = false;
+        } else {
+            if (inputY < workTop) inputY = workTop;
+            g_lastInputWasAboveList = true;
         }
-        
-        // 只有在菜單未顯示時才設置TOPMOST
         if (!state.menuShowing) {
-            SetWindowPos(state.hInputWnd, HWND_TOPMOST, 
-                        inputX, inputY, 
-                        inputWidth, INPUT_WINDOW_HEIGHT,
+            SetWindowPos(state.hInputWnd, HWND_TOPMOST,
+                        inputX, inputY, inputWidth, INPUT_WINDOW_HEIGHT,
                         SWP_NOACTIVATE | SWP_SHOWWINDOW);
         } else {
-            SetWindowPos(state.hInputWnd, HWND_NOTOPMOST, 
-                        inputX, inputY, 
-                        inputWidth, INPUT_WINDOW_HEIGHT,
+            SetWindowPos(state.hInputWnd, HWND_NOTOPMOST,
+                        inputX, inputY, inputWidth, INPUT_WINDOW_HEIGHT,
                         SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
-    } else {
+    }
+    if (!listWnd || !listRectValid) {
         // 沒有候選字時，優先使用候選字視窗的保存位置
         int inputX, inputY, inputWidth;
         bool useSavedPosition = false;
@@ -2563,14 +3551,15 @@ void positionInputWindow(GlobalState& state) {
         }
         
         if (useSavedPosition) {
-            // 使用保存的位置，字碼視窗定位在候選字視窗位置的上方
+            // 使用保存的位置，字碼視窗緊貼列表上方（與 WINDOW_SPACING 一致）
             int savedCandY = inputY;  // 保存候選字視窗的原始Y位置
-            inputY = savedCandY - INPUT_WINDOW_HEIGHT - 2;
+            const int inputListGapFallback = 2;
+            inputY = savedCandY - INPUT_WINDOW_HEIGHT - inputListGapFallback;
             
             // 確保字碼視窗在螢幕可見範圍內
             ScreenManager::MonitorInfo monitor = ScreenManager::getMonitorFromPoint({inputX, inputY});
             if (inputY < monitor.workArea.top) {
-                inputY = savedCandY + INPUT_WINDOW_HEIGHT + 2; // 如果上方放不下，放到候選字視窗位置下方
+                inputY = savedCandY + INPUT_WINDOW_HEIGHT + inputListGapFallback; // 如果上方放不下，放到候選字視窗位置下方
             }
         } else {
             // 只有在沒有任何位置信息時，才使用滑鼠位置

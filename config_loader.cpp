@@ -8,12 +8,42 @@
 
 namespace ConfigLoader {
 
-// 生成默认配置文件
-void createDefaultConfigFile() {
-    std::ofstream fout("interface_config.ini");
+// 將設定檔中的按鍵名稱轉為虛擬鍵碼（支援：A-Z、NumPad0-9）
+static int parseStrokeKeyFromString(const std::string& value) {
+    if (value.empty()) return 0;
+    
+    std::string s = value;
+    for (auto& ch : s) {
+        ch = static_cast<char>(::toupper(static_cast<unsigned char>(ch)));
+    }
+    
+    // 單一英文字母 A-Z
+    if (s.size() == 1 && s[0] >= 'A' && s[0] <= 'Z') {
+        return static_cast<int>(s[0]);
+    }
+    
+    // 小鍵盤數字 0-9（NUMPAD0~NUMPAD9 / VK_NUMPAD0~VK_NUMPAD9）
+    if (s == "NUMPAD0" || s == "VK_NUMPAD0") return VK_NUMPAD0;
+    if (s == "NUMPAD1" || s == "VK_NUMPAD1") return VK_NUMPAD1;
+    if (s == "NUMPAD2" || s == "VK_NUMPAD2") return VK_NUMPAD2;
+    if (s == "NUMPAD3" || s == "VK_NUMPAD3") return VK_NUMPAD3;
+    if (s == "NUMPAD4" || s == "VK_NUMPAD4") return VK_NUMPAD4;
+    if (s == "NUMPAD5" || s == "VK_NUMPAD5") return VK_NUMPAD5;
+    if (s == "NUMPAD6" || s == "VK_NUMPAD6") return VK_NUMPAD6;
+    if (s == "NUMPAD7" || s == "VK_NUMPAD7") return VK_NUMPAD7;
+    if (s == "NUMPAD8" || s == "VK_NUMPAD8") return VK_NUMPAD8;
+    if (s == "NUMPAD9" || s == "VK_NUMPAD9") return VK_NUMPAD9;
+    
+    // 無法解析時回傳 0 表示忽略
+    return 0;
+}
+
+// 生成預設配置檔（寫入 user/interfaceconfig.ini）
+static void createDefaultConfigFile(GlobalState& state) {
+    std::ofstream fout(Utils::wstrToUtf8(state.userDir + L"interfaceconfig.ini"));
     if (!fout.is_open()) return;
     
-    fout << "; interface_config.ini - 配置文件" << std::endl;
+    fout << "; interfaceconfig.ini - 配置文件" << std::endl;
     fout << "; 中文筆劃輸入法 介面配置" << std::endl;
     fout << std::endl;
     fout << "[Colors]" << std::endl;
@@ -39,6 +69,16 @@ void createDefaultConfigFile() {
     fout << "candidate_text_color=#000000" << std::endl;
     fout << "selected_candidate_bg_color=#F37E7E" << std::endl;
     fout << "selected_candidate_text_color=#01143B" << std::endl;
+    fout << "; 候選字 hover 顏色（可選，未設定則使用預設）" << std::endl;
+    fout << "candidate_hover_bg_color=#FFA930" << std::endl;
+    fout << "candidate_hover_text_color=#000000" << std::endl;
+    fout << std::endl;
+    fout << "; 聯想字視窗顏色" << std::endl;
+    fout << "prediction_bg_color=fcfaed" << std::endl;
+    fout << "prediction_text_color=000000" << std::endl;
+    fout << "prediction_first_item_bg_color=b0e1ff" << std::endl;
+    fout << "prediction_hover_bg_color=ffa930" << std::endl;
+    fout << "prediction_hover_text_color=000000" << std::endl;
     fout << std::endl;
     fout << "; 字碼輸入視窗顏色" << std::endl;
     fout << "input_background_color=#FFFFFF" << std::endl;
@@ -97,18 +137,36 @@ void createDefaultConfigFile() {
     fout << "transparency_alpha=100" << std::endl;
     fout << "; 聯想字功能開關（0=關閉，1=開啟）" << std::endl;
     fout << "enable_word_prediction=0" << std::endl;
+    fout << std::endl;
+    fout << "; 候選字選單顯示英文字碼（0=不顯示 預設，1=顯示如 3. 十[ui]）" << std::endl;
+    fout << "showCandidateCode=0" << std::endl;
+    fout << "; 輸入框筆劃符號顯示（0=uiojk，1=一丨丿丶フ 預設）" << std::endl;
+    fout << "showStrokeSymbols=1" << std::endl;
+    fout << "; 螢幕模式變更提示（0=靜默處理 預設，1=彈出提示）" << std::endl;
+    fout << "showScreenModeNotification=0" << std::endl;
+    fout << std::endl;
+    fout << "[InputSettings]" << std::endl;
+    fout << "; 萬用字元 * 觸發鍵（3+3 模式，支援：A-Z、NumPad0-9）" << std::endl;
+    fout << "; wildcardKey1：主要 * 按鍵（預設 L）" << std::endl;
+    fout << "; wildcardKey2：第二組 * 按鍵（預設 NumPad0）" << std::endl;
+    fout << "; 範例：L、H、NumPad0、NumPad1 ..." << std::endl;
+    fout << "wildcardKey1=L" << std::endl;
+    fout << "wildcardKey2=NumPad0" << std::endl;
+    fout << std::endl;
+    fout << "[MultiScreenSettings]" << std::endl;
+    fout << "; 多螢幕模式變更提示（與 WindowBehavior.showScreenModeNotification 相容）" << std::endl;
+    fout << "show_screen_change_notification=0" << std::endl;
     
     fout.close();
 }
 
 void loadInterfaceConfig(GlobalState& state) {
-    std::ifstream fin("interface_config.ini");
+    std::string pathNarrow = Utils::wstrToUtf8(state.userDir + L"interfaceconfig.ini");
+    std::ifstream fin(pathNarrow);
     if (!fin.is_open()) {
-        // 配置文件不存在，自动生成默认配置
-        createDefaultConfigFile();
+        createDefaultConfigFile(state);
         Utils::updateStatus(state, L"已自動生成預設配置文件");
-        // 重新尝试打开（如果创建成功）
-        fin.open("interface_config.ini");
+        fin.open(pathNarrow);
         if (!fin.is_open()) {
             Utils::updateStatus(state, L"無法創建配置文件，使用預設設定");
             return;
@@ -174,6 +232,20 @@ void loadInterfaceConfig(GlobalState& state) {
                     state.selectedCandidateBackgroundColor = Utils::parseColorFromString(value);
                 } else if (key == "selected_candidate_text_color") {
                     state.selectedCandidateTextColor = Utils::parseColorFromString(value);
+                } else if (key == "candidate_hover_bg_color") {
+                    state.candidateHoverBackgroundColor = Utils::parseColorFromString(value);
+                } else if (key == "candidate_hover_text_color") {
+                    state.candidateHoverTextColor = Utils::parseColorFromString(value);
+                } else if (key == "prediction_bg_color") {
+                    state.predictionBackgroundColor = Utils::parseColorFromString(value);
+                } else if (key == "prediction_text_color") {
+                    state.predictionTextColor = Utils::parseColorFromString(value);
+                } else if (key == "prediction_first_item_bg_color") {
+                    state.predictionFirstItemBgColor = Utils::parseColorFromString(value);
+                } else if (key == "prediction_hover_bg_color") {
+                    state.predictionHoverBgColor = Utils::parseColorFromString(value);
+                } else if (key == "prediction_hover_text_color") {
+                    state.predictionHoverTextColor = Utils::parseColorFromString(value);
                 // 字碼輸入視窗顏色（新增）
                 } else if (key == "input_background_color") {
                     state.inputBackgroundColor = Utils::parseColorFromString(value);
@@ -308,6 +380,12 @@ void loadInterfaceConfig(GlobalState& state) {
                     } catch (...) {}
                 } else if (key == "enable_word_prediction") {
                     state.enableWordPrediction = (value == "1" || value == "true");
+                } else if (key == "showCandidateCode") {
+                    state.showCandidateCode = (value == "1" || value == "true");
+                } else if (key == "showStrokeSymbols") {
+                    state.showStrokeSymbols = (value == "1" || value == "true");
+                } else if (key == "showScreenModeNotification") {
+                    state.showScreenModeNotification = (value == "1" || value == "true");
                 }
             } else if (currentSection == "InputSettings") {
                 if (key == "auto_wildcard_length") {
@@ -324,11 +402,20 @@ void loadInterfaceConfig(GlobalState& state) {
                             // 可以添加到 GlobalState 中使用
                         }
                     } catch (...) {}
+                } else if (key == "wildcardKey1") {
+                    int vk = parseStrokeKeyFromString(value);
+                    if (vk != 0) {
+                        state.wildcardKey1VK = vk;
+                    }
+                } else if (key == "wildcardKey2") {
+                    int vk = parseStrokeKeyFromString(value);
+                    if (vk != 0) {
+                        state.wildcardKey2VK = vk;
+                    }
                 }
             } else if (currentSection == "MultiScreenSettings") {
-                if (key == "show_screen_change_notification") {
-                    // 處理螢幕變更通知設定
-                    // state.showScreenChangeNotification = (value == "1" || value == "true");
+                if (key == "show_screen_change_notification" || key == "showScreenModeNotification") {
+                    state.showScreenModeNotification = (value == "1" || value == "true");
                 }
             }
         }
@@ -348,7 +435,7 @@ void refreshConfigs(GlobalState& state) {
     loadInterfaceConfig(state);
     
     // 載入所有字典和數據文件
-    Dictionary::loadMainDict("Zi-Ma-Biao.txt", state);
+    Dictionary::loadMainDict(state);
     Dictionary::loadPunctuator(state);  // 載入標點符號表
     Dictionary::loadPunctMenu(state);    // 載入標點選單
     Dictionary::loadUserDict(state);     // 載入用戶字典
@@ -363,6 +450,7 @@ void refreshConfigs(GlobalState& state) {
     // 刷新所有視窗
     if (state.hWnd) InvalidateRect(state.hWnd, nullptr, TRUE);
     if (state.hCandWnd) InvalidateRect(state.hCandWnd, nullptr, TRUE);
+    if (state.hPredWnd) InvalidateRect(state.hPredWnd, nullptr, TRUE);
     if (state.hInputWnd) InvalidateRect(state.hInputWnd, nullptr, TRUE);
     if (state.hBufferWnd && state.bufferMode) InvalidateRect(state.hBufferWnd, nullptr, TRUE);
     
@@ -370,14 +458,15 @@ void refreshConfigs(GlobalState& state) {
 }
 
 void saveInterfaceConfig(const GlobalState& state) {
-    // 读取现有配置文件内容，同时提取transparency_alpha的值（如果存在）
-    std::ifstream fin("interface_config.ini");
+    std::string pathNarrow = Utils::wstrToUtf8(state.userDir + L"interfaceconfig.ini");
+    std::ifstream fin(pathNarrow);
     std::vector<std::string> lines;
     std::string line;
     bool foundClipboardMode = false;
     bool foundEnableTransparency = false;
     bool foundTransparencyAlpha = false;
     bool foundEnableWordPrediction = false;
+    bool foundShowStrokeSymbols = false;
     std::string currentSection = "";
     int configFileAlpha = state.transparencyAlpha;  // 默认使用state中的值
     
@@ -432,6 +521,10 @@ void saveInterfaceConfig(const GlobalState& state) {
                         lines.push_back("enable_word_prediction=" + (state.enableWordPrediction ? std::string("1") : std::string("0")));
                         foundEnableWordPrediction = true;
                         continue;
+                    } else if (key == "showStrokeSymbols") {
+                        lines.push_back("showStrokeSymbols=" + (state.showStrokeSymbols ? std::string("1") : std::string("0")));
+                        foundShowStrokeSymbols = true;
+                        continue;
                     }
                 }
             }
@@ -470,6 +563,9 @@ void saveInterfaceConfig(const GlobalState& state) {
                 if (!foundEnableWordPrediction) {
                     toInsert.push_back("enable_word_prediction=" + (state.enableWordPrediction ? std::string("1") : std::string("0")));
                 }
+                if (!foundShowStrokeSymbols) {
+                    toInsert.push_back("showStrokeSymbols=" + (state.showStrokeSymbols ? std::string("1") : std::string("0")));
+                }
                 if (!toInsert.empty()) {
                     lines.insert(lines.begin() + i, toInsert.begin(), toInsert.end());
                 }
@@ -500,6 +596,9 @@ void saveInterfaceConfig(const GlobalState& state) {
                 if (!foundEnableWordPrediction) {
                     toInsert.push_back("enable_word_prediction=" + (state.enableWordPrediction ? std::string("1") : std::string("0")));
                 }
+                if (!foundShowStrokeSymbols) {
+                    toInsert.push_back("showStrokeSymbols=" + (state.showStrokeSymbols ? std::string("1") : std::string("0")));
+                }
                 if (!toInsert.empty()) {
                     lines.insert(lines.begin() + insertPos, toInsert.begin(), toInsert.end());
                 }
@@ -520,6 +619,12 @@ void saveInterfaceConfig(const GlobalState& state) {
         if (!foundTransparencyAlpha) {
             toInsert.push_back("transparency_alpha=" + std::to_string(state.transparencyAlpha));
         }
+        if (!foundEnableWordPrediction) {
+            toInsert.push_back("enable_word_prediction=" + (state.enableWordPrediction ? std::string("1") : std::string("0")));
+        }
+        if (!foundShowStrokeSymbols) {
+            toInsert.push_back("showStrokeSymbols=" + (state.showStrokeSymbols ? std::string("1") : std::string("0")));
+        }
         if (!toInsert.empty()) {
             lines.insert(lines.end(), toInsert.begin(), toInsert.end());
         }
@@ -535,10 +640,11 @@ void saveInterfaceConfig(const GlobalState& state) {
         lines.push_back("enable_transparency=" + (state.enableTransparency ? std::string("1") : std::string("0")));
         lines.push_back("transparency_alpha=" + std::to_string(configFileAlpha));
         lines.push_back("enable_word_prediction=" + (state.enableWordPrediction ? std::string("1") : std::string("0")));
+        lines.push_back("showStrokeSymbols=" + (state.showStrokeSymbols ? std::string("1") : std::string("0")));
     }
     
-    // 写回文件
-    std::ofstream fout("interface_config.ini");
+    // 寫回檔案
+    std::ofstream fout(pathNarrow);
     if (fout.is_open()) {
         for (const auto& l : lines) {
             fout << l << std::endl;
@@ -548,8 +654,7 @@ void saveInterfaceConfig(const GlobalState& state) {
 }
 
 void updateTransparencyAlphaFromConfig(GlobalState& state) {
-    // 只讀取配置文件中的transparency_alpha值，不修改其他配置
-    std::ifstream fin("interface_config.ini");
+    std::ifstream fin(Utils::wstrToUtf8(state.userDir + L"interfaceconfig.ini"));
     if (!fin.is_open()) {
         return;
     }

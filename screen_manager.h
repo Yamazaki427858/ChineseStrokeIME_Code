@@ -31,6 +31,9 @@ namespace ScreenManager {
     
     // 安全視窗定位
     POINT ensureSafePosition(POINT pt, int windowWidth, int windowHeight);
+    
+    // 取得視窗所在顯示器的有效工作區（已排除工作列）
+    RECT getWorkArea(HWND hwnd);
 }
 
 #endif // SCREEN_MANAGER_H

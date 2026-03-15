@@ -226,4 +226,17 @@ POINT ensureSafePosition(POINT pt, int windowWidth, int windowHeight) {
     return pt;
 }
 
+RECT getWorkArea(HWND hwnd) {
+    HMONITOR hMonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof(MONITORINFO) };
+    if (GetMonitorInfo(hMonitor, &mi)) {
+        return mi.rcWork;
+    }
+    RECT fallback = { 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
+    if (SystemParametersInfo(SPI_GETWORKAREA, 0, &fallback, 0)) {
+        return fallback;
+    }
+    return fallback;
+}
+
 } // namespace ScreenManager

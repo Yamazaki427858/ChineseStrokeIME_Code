@@ -6,7 +6,16 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
+#include <unordered_set>
 #include <ctime>
+
+// 輸入模式枚舉：用於統一管理候選/聯想/空閒狀態
+enum class InputMode {
+    IDLE,       // 無輸入，所有相關視窗隱藏
+    CAND_MODE,  // 字碼候選模式（顯示 hCandWnd）
+    PRED_MODE   // 聯想字模式（顯示 hPredWnd）
+};
 
 // ========== 【重要：更新版本號請修改此處】 ==========
 // 當前版本號 - 此版本號會顯示在「關於」對話框中，並用於版本更新檢查
@@ -16,7 +25,7 @@
 // 例如：3.1.0、Beta4.0.a、3.0.0-alpha、v2.0.0-beta.1 等均可
 // 版本比較：使用字符串比較，只要字符串不同即判定為不同版本
 //
-#define APP_VERSION "3.0.1"
+#define APP_VERSION "3.1.0"
 // ========== 【版本號定義結束】 ==========
 
 // 常數定義
@@ -85,6 +94,7 @@ struct DragState {
     bool isToolbarDragging = false;
     bool isInputDragging = false;
     bool isCandDragging = false;
+    bool isPredDragging = false;
     POINT dragOffset = {0};
 };
 
@@ -107,9 +117,14 @@ struct UIColors {
 
 // 全域狀態結構
 struct GlobalState {
+    // 路徑：exe 所在目錄下的 system\ 與 user\ 子目錄（程式啟動時初始化）
+    std::wstring systemDir;  // exe所在目錄 + "system\\"
+    std::wstring userDir;    // exe所在目錄 + "user\\"
+
     // 視窗控制代碼
     HWND hWnd = NULL;
-    HWND hCandWnd = NULL;
+    HWND hCandWnd = NULL;      // 字碼候選字視窗
+    HWND hPredWnd = NULL;      // 聯想字視窗（之後會獨立使用，目前預設隱藏）
     HWND hBufferWnd = NULL;
 	HWND hInputWnd = NULL;
 	
@@ -142,17 +157,37 @@ struct GlobalState {
     POINT selectionStartPoint = {0};   // 選取起始座標
     POINT selectionEndPoint = {0};     // 選取結束座標
     
-    // 右鍵選單相關
-    bool showContextMenu = false;      // 是否顯示右鍵選單
+    // 右鍵選單相關（主視窗 / 候選視窗共用）
+    bool showContextMenu = false;      // 是否顯示右鍵選單（目前主要用於主視窗）
     RECT contextMenuRect = {0};        // 右鍵選單位置
+    int contextMenuCandIndex = -1;     // 右鍵點選的候選索引（用於 pinned/locked/del/blocked）
 
     
     // 字典資料
     std::map<std::wstring, std::vector<std::wstring>> dict;
     std::map<std::wstring, std::vector<std::wstring>> punct;
     std::map<std::wstring, WordInfo> wordFreq;
-    std::map<std::wstring, std::vector<std::wstring>> contextLearning;
+    
+    // 智能聯想引擎資料結構
+    // bigramIndex: 從 Zi-Ma-Biao.txt 預建的相鄰字對索引（前字 -> 後字 -> 共現次數）
+    std::map<wchar_t, std::map<wchar_t, int>> bigramIndex;
+    
+    // contextLearning: 個人上下文學習（前字/詞 -> 後字/詞 -> 使用次數）
+    // 改寫：從 map<wstring, vector<wstring>> 改為 map<wstring, map<wstring, int>>
+    std::map<std::wstring, std::map<std::wstring, int>> contextLearning;
+    
+    // lockedContext: 標記 locked/pinned 條目（前字, 後字/詞）對
+    // locked: score = ∞（永遠置頂）
+    // pinned: score = count + bonus（bonus 預設值可在設定檔調整）
+    std::set<std::pair<std::wstring, std::wstring>> lockedContext;
+    std::set<std::pair<std::wstring, std::wstring>> pinnedContext;
+    // blockedContext: 使用者選擇「永不再顯示」的聯想條目（在候選列表中完全忽略）
+    std::set<std::pair<std::wstring, std::wstring>> blockedContext;
+    
+    // 最近一次選字（單字或詞），用於 contextLearning[單字]->後字/詞
     std::wstring lastSelected = L"";
+    // 最近兩個選字組成的片語，例如「電腦」「系統」，用於 contextLearning[片語]->後字/詞
+    std::wstring lastBigram = L"";
     std::vector<std::wstring> punctCandidates;
     int dictSize = 0;
     
@@ -160,6 +195,11 @@ struct GlobalState {
     // 格式：第一個字 -> 後續可能的字列表（按頻率排序）
     std::map<std::wstring, std::vector<std::wstring>> wordPhrases;
     int phraseDictSize = 0;  // 詞語庫大小
+    
+    // 聯想字功能設定
+    int contextLearningPinnedBonus = 50;      // pinned 條目的額外分數加成
+    int contextLearningMaxAutoEntries = 2000; // 自動學習條目的最大數量（全域上限）
+    int contextLearningMinAutoCount = 2;      // 儲存時自動學習的最小次數（<=此值視為雜訊不寫入）
     
     // 暫放視窗模式
     bool bufferMode = false;
@@ -175,7 +215,32 @@ struct GlobalState {
     bool menuShowing = false;  // 選單是否正在顯示（用於防止TOPMOST衝突）
     bool imePaused = false;  // 輸入法是否暫停（鍵盤鉤子是否已釋放）
     bool enableWordPrediction = true;  // 是否啟用聯想字功能
-	
+    bool isPredictionMode = false;     // 是否處於聯想字模式（hPredWnd 顯示中）
+
+    // 統一輸入模式（初始為空閒）
+    InputMode currentMode = InputMode::IDLE;
+    
+    // 候選字選單是否顯示英文字碼（僅 interface_config.ini，預設關閉）
+    bool showCandidateCode = false;
+    // 候選字 hover 顏色（滑鼠移到候選列時的背景/文字色，可由 interface_config.ini 自訂）
+    COLORREF candidateHoverBackgroundColor = RGB(0xFF, 0xA9, 0x30); // 預設與聯想字 hover 相同的橘色
+    COLORREF candidateHoverTextColor = RGB(0x00, 0x00, 0x00);       // 預設黑色文字
+    int hoverCandidateIndex = -1;  // 目前滑鼠懸停的候選索引
+
+    // 聯想字視窗獨立顏色（可於 interfaceconfig.ini 自定）
+    COLORREF predictionBackgroundColor  = RGB(0xFC, 0xFA, 0xED); // #fcfaed
+    COLORREF predictionTextColor        = RGB(0x00, 0x00, 0x00); // #000000
+    COLORREF predictionFirstItemBgColor = RGB(0xB0, 0xE1, 0xFF); // #b0e1ff（第一個聯想字底色）
+    COLORREF predictionHoverBgColor     = RGB(0xFF, 0xA9, 0x30); // #ffa930
+    COLORREF predictionHoverTextColor   = RGB(0x00, 0x00, 0x00); // #000000
+    // 輸入框顯示筆劃符號或英文字母（true=筆劃符號一丨丿丶フ，false=uiojk）
+    bool showStrokeSymbols = true;
+    // 螢幕模式變更時是否彈出提示（預設關閉，靜默處理）
+    bool showScreenModeNotification = false;
+    
+    // 萬用字元 * 觸發鍵（3+3 模式用，對應虛擬鍵碼，預設為 L 與 NumPad0）
+    int wildcardKey1VK = 'L';
+    int wildcardKey2VK = VK_NUMPAD0;
 	
 	// 歷史記錄
 	struct TextSnapshot {

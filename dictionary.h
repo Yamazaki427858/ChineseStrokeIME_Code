@@ -6,11 +6,18 @@
 
 namespace Dictionary {
     // 字典載入函數
-    void loadMainDict(const char* filename, GlobalState& state);
+    void loadMainDict(GlobalState& state);
     void loadPunctuator(GlobalState& state);
     void loadPunctMenu(GlobalState& state);
     void loadUserDict(GlobalState& state);
     void saveUserDict(const GlobalState& state);
+    
+    // 智能聯想引擎持久化
+    void loadContextLearning(GlobalState& state);
+    void saveContextLearning(GlobalState& state);
+    // 聯想條目模式設定（locked 永遠置頂 / pinned 置頂+加分），供日後 UI 或腳本呼叫
+    void setContextLocked(GlobalState& state, const std::wstring& prevWord, const std::wstring& nextWord, bool locked);
+    void setContextPinned(GlobalState& state, const std::wstring& prevWord, const std::wstring& nextWord, bool pinned);
     
     // 字典更新函數（從GitHub下載）
     bool updateDictFromGitHub(GlobalState& state, bool showProgress = true);
@@ -46,7 +53,7 @@ namespace Dictionary {
     void showPredictionsAfterSelection(GlobalState& state, const std::wstring& selected);
     
     // 詞語庫功能
-    void loadWordPhrases(GlobalState& state, const char* filename = "word_phrases.txt");
+    void loadWordPhrases(GlobalState& state);
 }
 
 #endif // DICTIONARY_H
