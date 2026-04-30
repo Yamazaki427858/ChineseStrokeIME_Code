@@ -3,7 +3,7 @@
 <br>
 <br>
 # 下載最新版本的ChineseStrokeIME和原始碼
-### 2026年5月最新版本： 中文筆劃輸入法 V3.2.0
+### 2026年5月最新版本： 中文筆劃輸入法 V3.2.0 
 💾下載：https://github.com/Yamazaki427858/ChineseStrokeIME_Releases/releases
 <br>
 <br>
