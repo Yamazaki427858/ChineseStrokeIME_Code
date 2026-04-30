@@ -793,11 +793,11 @@ bool isPointInNextPageButton(int x, int y, const GlobalState& state) {
 LRESULT handleKeyboardInput(HWND hwnd, WPARAM wp) {
     DWORD key = (DWORD)wp;
     if (g_state.chineseMode) {
-        // 筆劃鍵與萬用字元 * 按鍵（3+3 用，Wildcard 鍵可在 [InputSettings] 中自訂）
+        // 筆劃鍵與萬用字元 * 按鍵：使用自訂判斷函式，支援 [InputSettings] 中的自訂按鍵
         bool isStrokeOrWildcardKey =
-            key == 'U' || key == 'I' || key == 'O' || key == 'J' || key == 'K' || key == 'P' ||
-            key == VK_NUMPAD7 || key == VK_NUMPAD8 || key == VK_NUMPAD9 ||
-            key == VK_NUMPAD4 || key == VK_NUMPAD5 ||
+            InputHandler::isStrokeLetterVK(g_state, key) ||
+            InputHandler::isNumpadStrokeVK(g_state, key) ||
+            key == 'P' ||
             key == static_cast<DWORD>(g_state.wildcardKey1VK) ||
             key == static_cast<DWORD>(g_state.wildcardKey2VK);
         if (isStrokeOrWildcardKey) {
@@ -981,6 +981,22 @@ LRESULT handleCommand(HWND hwnd, WPARAM wp) {
             Utils::updateStatus(g_state, g_state.showStrokeSymbols ? 
                 L"筆劃符號顯示已開啟" : L"筆劃符號顯示已關閉");
             if (g_state.hInputWnd) InvalidateRect(g_state.hInputWnd, nullptr, TRUE);
+            break;
+        }
+        case 1016: {
+            g_state.useCustomStrokeKeys = !g_state.useCustomStrokeKeys;
+            ConfigLoader::saveInterfaceConfig(g_state);
+            Utils::updateStatus(g_state, g_state.useCustomStrokeKeys
+                ? L"自訂字母筆劃五鍵：已開啟（interfaceconfig.ini：strokeKeyU~K）"
+                : L"自訂字母筆劃五鍵：已關閉（使用預設 U I O J K）");
+            break;
+        }
+        case 1017: {
+            g_state.useCustomNumpadStrokeKeys = !g_state.useCustomNumpadStrokeKeys;
+            ConfigLoader::saveInterfaceConfig(g_state);
+            Utils::updateStatus(g_state, g_state.useCustomNumpadStrokeKeys
+                ? L"自訂數字小鍵盤筆劃五鍵：已開啟（interfaceconfig.ini：numpadStrokeKeyU~K）"
+                : L"自訂數字小鍵盤筆劃五鍵：已關閉（使用預設 NumPad78945）");
             break;
         }
         case 1015: {
@@ -3052,6 +3068,18 @@ static void trackMainToolbarPopupMenu(HWND hwnd) {
     AppendMenu(hMenu, MF_STRING, 1010, predictionText.c_str());
     std::wstring strokeSymbolText = g_state.showStrokeSymbols ? L"✓ 筆劃符號：開" : L"筆劃符號：關";
     AppendMenu(hMenu, MF_STRING, 1011, strokeSymbolText.c_str());
+    HMENU hStrokeCustomMenu = CreatePopupMenu();
+    if (hStrokeCustomMenu) {
+        std::wstring letterToggle = g_state.useCustomStrokeKeys
+            ? L"✓ 字母鍵自訂"
+            : L"字母鍵自訂";
+        std::wstring numpadToggle = g_state.useCustomNumpadStrokeKeys
+            ? L"✓ 數字小鍵盤自訂"
+            : L"數字小鍵盤自訂";
+        AppendMenu(hStrokeCustomMenu, MF_STRING, 1016, letterToggle.c_str());
+        AppendMenu(hStrokeCustomMenu, MF_STRING, 1017, numpadToggle.c_str());
+        AppendMenu(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hStrokeCustomMenu), L"自訂筆劃五鍵");
+    }
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
     std::wstring bufferTb = g_state.bufferMode ? L"✓ 暫放模式" : L"暫放模式";
     AppendMenu(hMenu, MF_STRING, 2012, bufferTb.c_str());

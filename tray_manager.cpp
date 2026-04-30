@@ -94,6 +94,19 @@ void showTrayMenu(HWND hwnd, GlobalState& state) {
     
     AppendMenu(hMenu, MF_STRING, 2006, L"🔄 重新載入配置");
     AppendMenu(hMenu, MF_STRING, 2013, L"⬇️ 從GitHub更新字碼表");
+
+    HMENU hStrokeCustomMenu = CreatePopupMenu();
+    if (hStrokeCustomMenu) {
+        std::wstring letterToggle = state.useCustomStrokeKeys
+            ? L"✓ 字母鍵自訂"
+            : L"字母鍵自訂";
+        std::wstring numpadToggle = state.useCustomNumpadStrokeKeys
+            ? L"✓ 數字小鍵盤自訂"
+            : L"數字小鍵盤自訂";
+        AppendMenu(hStrokeCustomMenu, MF_STRING, 1016, letterToggle.c_str());
+        AppendMenu(hStrokeCustomMenu, MF_STRING, 1017, numpadToggle.c_str());
+        AppendMenu(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hStrokeCustomMenu), L"自訂筆劃五鍵");
+    }
     
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
     
