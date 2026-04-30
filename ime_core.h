@@ -25,7 +25,7 @@ enum class InputMode {
 // 例如：3.1.0、Beta4.0.a、3.0.0-alpha、v2.0.0-beta.1 等均可
 // 版本比較：使用字符串比較，只要字符串不同即判定為不同版本
 //
-#define APP_VERSION "3.1.0"
+#define APP_VERSION "3.2.0"
 // ========== 【版本號定義結束】 ==========
 
 // 常數定義
