@@ -45,6 +45,12 @@ const int TOOLBAR_HEIGHT = 35;
 const int BUTTON_HEIGHT = 22;
 const int SMALL_BUTTON_WIDTH = 35;
 const int MODE_BUTTON_WIDTH = 35;
+// 迷你「劃／E」工具列（僅兩鍵，類舊版語言列按鈕尺寸）；四邊留白均等
+const int MINI_TOOLBAR_PAD = 5;
+const int MINI_TOOLBAR_CELL_W = 34;
+const int MINI_TOOLBAR_CELL_H = 22;
+const int MINI_TOOLBAR_WIDTH = MINI_TOOLBAR_PAD * 2 + MINI_TOOLBAR_CELL_W * 2;
+const int MINI_TOOLBAR_HEIGHT = MINI_TOOLBAR_PAD * 2 + MINI_TOOLBAR_CELL_H;
 
 // 位置記憶結構
 struct Position {
@@ -73,6 +79,8 @@ struct WordInfo {
 // UI元素位置結構
 struct ToolbarElements {
     RECT modeIndicatorRect = {0};
+    RECT strokeBadgeRect = {0};
+    RECT englishBadgeRect = {0};
     RECT statusIndicatorRect = {0};
     RECT menuButtonRect = {0};
     RECT bufferButtonRect = {0};    // ⌘暫放按鈕
@@ -82,6 +90,8 @@ struct ToolbarElements {
     
     // 懸停狀態
     bool modeIndicatorHover = false;
+    bool strokeBadgeHover = false;
+    bool englishBadgeHover = false;
     bool menuButtonHover = false;
     bool bufferButtonHover = false;
     bool restoreButtonHover = false;
@@ -161,6 +171,7 @@ struct GlobalState {
     bool showContextMenu = false;      // 是否顯示右鍵選單（目前主要用於主視窗）
     RECT contextMenuRect = {0};        // 右鍵選單位置
     int contextMenuCandIndex = -1;     // 右鍵點選的候選索引（用於 pinned/locked/del/blocked）
+    std::wstring predictionQueryWord;  // 當前聯想視窗的查詢前文（用於右鍵選單 prev key）
 
     
     // 字典資料
@@ -188,18 +199,30 @@ struct GlobalState {
     std::wstring lastSelected = L"";
     // 最近兩個選字組成的片語，例如「電腦」「系統」，用於 contextLearning[片語]->後字/詞
     std::wstring lastBigram = L"";
+    // 最近連續選字的滾動前文（最多9字），用於多字前綴聯想查詢
+    std::wstring lastContext = L"";
+    // 聯想字退格糾正：可還原剛學入的關聯與 lastContext/lastBigram/lastSelected
+    bool         pendingUnlearnFromPrediction = false;
+    std::wstring pendingUnlearnContextSnap;   // learn 前的 lastContext
+    std::wstring pendingUnlearnBigramSnap;     // learn 前的 lastBigram
+    std::wstring pendingUnlearnPrev;          // learn 前的 lastSelected
+    std::wstring pendingUnlearnNext;          // 本次選中的聯想內容
     std::vector<std::wstring> punctCandidates;
     int dictSize = 0;
     
     // 詞語庫資料（用於聯想字功能）
     // 格式：第一個字 -> 後續可能的字列表（按頻率排序）
     std::map<std::wstring, std::vector<std::wstring>> wordPhrases;
+    std::map<std::wstring, std::map<std::wstring, double>> wordPhraseScores;
     int phraseDictSize = 0;  // 詞語庫大小
+
+    // 字碼反查快取：候選顯示字碼時避免每次掃描整份 dict
+    std::map<std::wstring, std::wstring> charToCode;
     
     // 聯想字功能設定
     int contextLearningPinnedBonus = 50;      // pinned 條目的額外分數加成
     int contextLearningMaxAutoEntries = 2000; // 自動學習條目的最大數量（全域上限）
-    int contextLearningMinAutoCount = 2;      // 儲存時自動學習的最小次數（<=此值視為雜訊不寫入）
+    int contextLearningMinAutoCount = 0;      // 儲存門檻（已廢棄為雜訊過濾，現在次數>=1即存入）
     
     // 暫放視窗模式
     bool bufferMode = false;
@@ -215,6 +238,7 @@ struct GlobalState {
     bool menuShowing = false;  // 選單是否正在顯示（用於防止TOPMOST衝突）
     bool imePaused = false;  // 輸入法是否暫停（鍵盤鉤子是否已釋放）
     bool enableWordPrediction = true;  // 是否啟用聯想字功能
+    int  maxWordPredictions = 100;     // 聯想字視窗最多顯示的候選數（可在 interfaceconfig.ini 自定，預設 100）
     bool isPredictionMode = false;     // 是否處於聯想字模式（hPredWnd 顯示中）
 
     // 統一輸入模式（初始為空閒）
@@ -237,10 +261,29 @@ struct GlobalState {
     bool showStrokeSymbols = true;
     // 螢幕模式變更時是否彈出提示（預設關閉，靜默處理）
     bool showScreenModeNotification = false;
+    // 迷你「劃／E」工具列（僅兩鍵＋右鍵選單；interfaceconfig.ini [WindowBehavior]，預設關閉）
+    bool toolbarClassicModeBadges = false;
     
     // 萬用字元 * 觸發鍵（3+3 模式用，對應虛擬鍵碼，預設為 L 與 NumPad0）
     int wildcardKey1VK = 'L';
     int wildcardKey2VK = VK_NUMPAD0;
+
+    // 自訂筆劃字母鍵（對應內部字根 u i o j k；關閉時行為同固定 U I O J K）
+    // 開啟後僅 strokeKeyU~K 與下方小鍵盤筆劃鍵作為筆劃（與 useCustomNumpadStrokeKeys 分開）
+    bool useCustomStrokeKeys = false;
+    int strokeKeyUVK = 'U';
+    int strokeKeyIVK = 'I';
+    int strokeKeyOVK = 'O';
+    int strokeKeyJVK = 'J';
+    int strokeKeyKVK = 'K';
+
+    // 自訂小鍵盤筆劃五鍵（僅 VK_NUMPAD0~9；關閉時為 7/8/9/4/5 對應 u i o j k）
+    bool useCustomNumpadStrokeKeys = false;
+    int numpadStrokeKeyUVK = VK_NUMPAD7;
+    int numpadStrokeKeyIVK = VK_NUMPAD8;
+    int numpadStrokeKeyOVK = VK_NUMPAD9;
+    int numpadStrokeKeyJVK = VK_NUMPAD4;
+    int numpadStrokeKeyKVK = VK_NUMPAD5;
 	
 	// 歷史記錄
 	struct TextSnapshot {
@@ -355,6 +398,8 @@ namespace Utils {
     std::string wstrToUtf8(const std::wstring& ws);
     void updateStatus(GlobalState& state, const std::wstring& msg);
     bool isPunctuation(const std::wstring& word);
+    /// 句讀中斷（。?! 等）：應斷絕多字前綴與跨句聯想文脈
+    bool isStrongContextBreakPunct(const std::wstring& word);
     COLORREF parseColorFromString(const std::string& colorStr);
     
     // OptimizedUI工具函數

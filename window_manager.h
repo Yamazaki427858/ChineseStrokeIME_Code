@@ -70,6 +70,9 @@ namespace WindowManager {
     // 半透明功能
     void applyTransparency(GlobalState& state);
 
+    // 完整／迷你工具列切換後同步主視窗外框尺寸與相關視窗位置
+    void syncOptimizedToolbarFrame(GlobalState& state);
+
     // 輸入模式切換（統一管理相關視窗顯示）
     void switchMode(GlobalState& state, InputMode newMode);
     

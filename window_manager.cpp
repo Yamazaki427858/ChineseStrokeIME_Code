@@ -13,6 +13,7 @@
 #include <fstream>
 
 // 前向宣告
+extern GlobalState g_state;
 extern TrayManager::TrayIconData g_trayIcon;
 extern HHOOK g_hKeyboardHook;
 
@@ -693,8 +694,8 @@ void positionMainWindow(GlobalState& state) {
     int w = state.windowWidth;
     int h = state.windowHeight;
     if (state.useOptimizedUI) {
-        w = TOOLBAR_WIDTH;
-        h = TOOLBAR_HEIGHT;
+        w = state.toolbarClassicModeBadges ? MINI_TOOLBAR_WIDTH : TOOLBAR_WIDTH;
+        h = state.toolbarClassicModeBadges ? MINI_TOOLBAR_HEIGHT : TOOLBAR_HEIGHT;
     }
     
     // 以「目前工具列位置所在螢幕」的工作區做邊界，避免接上副螢幕時被當成越界而推到主螢幕邊緣
@@ -717,6 +718,41 @@ void positionMainWindow(GlobalState& state) {
     PositionManager::g_toolbarPos.y = y;
     
     SetWindowPos(state.hWnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+}
+
+void syncOptimizedToolbarFrame(GlobalState& state) {
+    if (!state.hWnd || !state.useOptimizedUI) {
+        return;
+    }
+    int w = state.toolbarClassicModeBadges ? MINI_TOOLBAR_WIDTH : TOOLBAR_WIDTH;
+    int h = state.toolbarClassicModeBadges ? MINI_TOOLBAR_HEIGHT : TOOLBAR_HEIGHT;
+    RECT wr;
+    GetWindowRect(state.hWnd, &wr);
+    int x = wr.left;
+    int y = wr.top;
+    POINT toolbarPt = {x, y};
+    RECT workArea = ScreenManager::getMonitorFromPoint(toolbarPt).workArea;
+    const int margin = 5;
+    if (x + w > workArea.right - margin) {
+        x = workArea.right - w - margin;
+    }
+    if (x < workArea.left + margin) {
+        x = workArea.left + margin;
+    }
+    if (y + h > workArea.bottom - margin) {
+        y = workArea.bottom - h - margin;
+    }
+    if (y < workArea.top + margin) {
+        y = workArea.top + margin;
+    }
+    PositionManager::g_toolbarPos.x = x;
+    PositionManager::g_toolbarPos.y = y;
+    SetWindowPos(state.hWnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+    InvalidateRect(state.hWnd, nullptr, TRUE);
+    if (state.bufferMode) {
+        updateBufferWindowPosition(state);
+    }
+    positionWindowsOptimized(state);
 }
 
 // 注意：传统UI按钮检测函数（isPointInCloseButton, isPointInModeButton, 
@@ -800,9 +836,43 @@ LRESULT handleKeyboardInput(HWND hwnd, WPARAM wp) {
     if (key >= '1' && key <= '9') { Dictionary::selectCandidate(g_state, key - '1'); return 0; }
     if (key == VK_BACK) {
         if (!g_state.input.empty()) {
+            // 有筆劃緩衝：只刪最後一個筆劃，不觸及前景文字
             g_state.input.pop_back();
             Dictionary::updateCandidates(g_state);
             InvalidateRect(hwnd, nullptr, TRUE);
+        } else if (g_state.isPredictionMode) {
+            // 聯想字模式 + 緩衝已空 = 使用者想撤銷剛選的聯想字
+            // 先反學習（若適用）
+            bool shouldDeletePrediction = g_state.pendingUnlearnFromPrediction;
+            if (shouldDeletePrediction) {
+                Dictionary::unlearnFromLastPrediction(g_state);
+            }
+            // 關閉聯想字視窗（isInputting = false 後，鉤子不再攔截注入退格）
+            g_state.input.clear();
+            g_state.candidates.clear();
+            g_state.candidateCodes.clear();
+            g_state.showCand = false;
+            g_state.isInputting = false;
+            g_state.isPredictionMode = false;
+            g_state.inputError = false;
+            g_state.showPunctMenu = false;
+            if (g_state.hPredWnd) ShowWindow(g_state.hPredWnd, SW_HIDE);
+            if (g_state.hCandWnd) ShowWindow(g_state.hCandWnd, SW_HIDE);
+            if (g_state.hInputWnd) ShowWindow(g_state.hInputWnd, SW_HIDE);
+            WindowManager::switchMode(g_state, InputMode::IDLE);
+            IMEManager::restoreWindowsIME();
+            InvalidateRect(hwnd, nullptr, TRUE);
+            // 僅在有待撤銷的聯想時才送退格給前景（刪掉剛上屏的錯誤聯想字）
+            // 此時 isInputting 已是 false，鉤子不再攔截此注入退格，不會形成循環
+            if (shouldDeletePrediction) {
+                InputHandler::sendBackspaceToForeground();
+            }
+        } else {
+            // 緩衝空 + 非聯想模式：用戶在刪字，語境改變，完全中斷聯想前文
+            g_state.lastSelected.clear();
+            g_state.lastBigram.clear();
+            g_state.lastContext.clear();
+            g_state.pendingUnlearnFromPrediction = false;
         }
         return 0;
     }
@@ -816,6 +886,11 @@ LRESULT handleKeyboardInput(HWND hwnd, WPARAM wp) {
         g_state.isInputting = false;
         g_state.inputError = false;
         g_state.showPunctMenu = false;
+        // ESC 中斷輸入：清除前文記憶，避免下一個輸入的字被誤學習成與上一個字的聯想
+        g_state.lastSelected.clear();
+        g_state.lastBigram.clear();
+        g_state.lastContext.clear();
+        g_state.pendingUnlearnFromPrediction = false;
         if (g_state.hCandWnd) ShowWindow(g_state.hCandWnd, SW_HIDE);
         if (g_state.hPredWnd) ShowWindow(g_state.hPredWnd, SW_HIDE);
         if (g_state.hInputWnd) ShowWindow(g_state.hInputWnd, SW_HIDE);
@@ -908,14 +983,35 @@ LRESULT handleCommand(HWND hwnd, WPARAM wp) {
             if (g_state.hInputWnd) InvalidateRect(g_state.hInputWnd, nullptr, TRUE);
             break;
         }
+        case 1015: {
+            g_state.toolbarClassicModeBadges = !g_state.toolbarClassicModeBadges;
+            ConfigLoader::saveInterfaceConfig(g_state);
+            syncOptimizedToolbarFrame(g_state);
+            PositionManager::savePositions(g_state);
+            Utils::updateStatus(g_state, g_state.toolbarClassicModeBadges
+                ? L"已改為縮小顯示工作列（於列上右鍵開啟選單）"
+                : L"已恢復完整工作列");
+            break;
+        }
+        case 1020:
+            TrayManager::hideToTray(hwnd, &g_trayIcon);
+            break;
+        case 1022:
+            if (MessageBoxW(hwnd, L"確定要關閉輸入法嗎？", L"確認關閉", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                PostMessage(hwnd, WM_CLOSE, 0, 0);
+            }
+            break;
         case 1101: // 候選右鍵：切換 pinned
         case 1102: // 候選右鍵：切換 locked
         case 1103: // 候選右鍵：刪除此聯想（可再次學回）
         case 1104: { // 候選右鍵：永不再顯示 / 取消封鎖
             int idx = g_state.contextMenuCandIndex;
             if (idx < 0 || idx >= (int)g_state.candidates.size()) break;
-            if (g_state.lastSelected.empty()) break;
-            std::wstring prev = g_state.lastSelected;
+            // 使用 predictionQueryWord（聯想視窗的查詢前文）作為 prev key，
+            // 而非 lastSelected（選字後 lastSelected 已更新為剛選的字，不再是前文）
+            std::wstring prev = g_state.predictionQueryWord;
+            if (prev.empty()) prev = g_state.lastSelected;  // 兜底
+            if (prev.empty()) break;
             std::wstring next = g_state.candidates[idx];
             std::pair<std::wstring, std::wstring> key(prev, next);
             
@@ -1256,7 +1352,9 @@ LRESULT CALLBACK CandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             HMENU hMenu = CreatePopupMenu();
             
             // 依當前狀態動態決定 pinned / locked / block 文案
-            std::wstring prev = g_state.lastSelected;
+            // 使用 predictionQueryWord（查詢前文）而非 lastSelected（已更新到剛選的字）
+            std::wstring prev = g_state.predictionQueryWord.empty()
+                ? g_state.lastSelected : g_state.predictionQueryWord;
             std::wstring next = g_state.candidates[actualIndex];
             std::pair<std::wstring, std::wstring> key(prev, next);
             bool isPinned = g_state.pinnedContext.find(key) != g_state.pinnedContext.end();
@@ -1540,7 +1638,8 @@ LRESULT CALLBACK PredProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             
             HMENU hMenu = CreatePopupMenu();
             
-            std::wstring prev = g_state.lastSelected;
+            std::wstring prev = g_state.predictionQueryWord.empty()
+                ? g_state.lastSelected : g_state.predictionQueryWord;
             std::wstring next = g_state.candidates[actualIndex];
             std::pair<std::wstring, std::wstring> key(prev, next);
             bool isPinned  = g_state.pinnedContext.find(key)  != g_state.pinnedContext.end();
@@ -2371,6 +2470,71 @@ case WM_KEYDOWN: {
 
 // OptimizedUI工具列繪製函數
 void drawOptimizedToolbar(HDC hdc, RECT rc, GlobalState& state) {
+    SetBkMode(hdc, TRANSPARENT);
+
+    if (state.toolbarClassicModeBadges) {
+        const COLORREF kFace = RGB(192, 192, 192);
+        const COLORREF kFaceOn = RGB(172, 172, 172);
+        const COLORREF kFaceHover = RGB(210, 208, 206);
+        const COLORREF kGlyph = RGB(96, 32, 32);
+
+        HBRUSH hBg = CreateSolidBrush(kFace);
+        FillRect(hdc, &rc, hBg);
+        DeleteObject(hBg);
+
+        HPEN hPen = CreatePen(PS_SOLID, 1, RGB(128, 128, 128));
+        HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+        HBRUSH hOldBr = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        Rectangle(hdc, 0, 0, rc.right, rc.bottom);
+        SelectObject(hdc, hOldBr);
+        SelectObject(hdc, hOldPen);
+        DeleteObject(hPen);
+
+        int px = MINI_TOOLBAR_PAD;
+        int py = MINI_TOOLBAR_PAD;
+        int cw = MINI_TOOLBAR_CELL_W;
+        int ch = MINI_TOOLBAR_CELL_H;
+        state.toolbarElements.strokeBadgeRect = {px, py, px + cw, py + ch};
+        state.toolbarElements.englishBadgeRect = {px + cw, py, px + 2 * cw, py + ch};
+        state.toolbarElements.modeIndicatorRect = {0, 0, -1, -1};
+        state.toolbarElements.statusIndicatorRect = {0, 0, -1, -1};
+        state.toolbarElements.menuButtonRect = {0, 0, -1, -1};
+        state.toolbarElements.bufferButtonRect = {0, 0, -1, -1};
+        state.toolbarElements.restoreButtonRect = {0, 0, -1, -1};
+        state.toolbarElements.minimizeButtonRect = {0, 0, -1, -1};
+        state.toolbarElements.closeButtonRect = {0, 0, -1, -1};
+
+        auto paintSeg = [&](RECT seg, bool pressed, bool hover, const wchar_t* txt) {
+            COLORREF fill = pressed ? kFaceOn : kFace;
+            if (hover) {
+                fill = kFaceHover;
+            }
+            HBRUSH br = CreateSolidBrush(fill);
+            FillRect(hdc, &seg, br);
+            DeleteObject(br);
+            UINT edgeFlags = BF_RECT;
+            if (pressed) {
+                DrawEdge(hdc, &seg, EDGE_SUNKEN, edgeFlags);
+            } else {
+                DrawEdge(hdc, &seg, EDGE_RAISED, edgeFlags);
+            }
+            HFONT hf = CreateFontW(16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft JhengHei");
+            HFONT hOldF = (HFONT)SelectObject(hdc, hf);
+            SetTextColor(hdc, kGlyph);
+            DrawTextW(hdc, txt, -1, &seg, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(hdc, hOldF);
+            DeleteObject(hf);
+        };
+
+        paintSeg(state.toolbarElements.strokeBadgeRect, state.chineseMode,
+                 state.toolbarElements.strokeBadgeHover, L"劃");
+        paintSeg(state.toolbarElements.englishBadgeRect, !state.chineseMode,
+                 state.toolbarElements.englishBadgeHover, L"E");
+        return;
+    }
+
     // 背景
     HBRUSH hBg = CreateSolidBrush(state.uiColors.toolbarBgColor);
     FillRect(hdc, &rc, hBg);
@@ -2384,8 +2548,6 @@ void drawOptimizedToolbar(HDC hdc, RECT rc, GlobalState& state) {
     SelectObject(hdc, hOldBrush);
     SelectObject(hdc, hOldPen);
     DeleteObject(hPen);
-    
-    SetBkMode(hdc, TRANSPARENT);
     
     int x = 5;
     int y = (rc.bottom - BUTTON_HEIGHT) / 2;
@@ -2521,24 +2683,42 @@ bool isPointInOptimizedButton(int x, int y, const RECT& buttonRect) {
 
 // OptimizedUI按鈕懸停狀態更新
 void updateOptimizedButtonHover(int x, int y, GlobalState& state) {
-    bool newModeHover = isPointInOptimizedButton(x, y, state.toolbarElements.modeIndicatorRect);
-    bool newMenuHover = isPointInOptimizedButton(x, y, state.toolbarElements.menuButtonRect);
-    bool newBufferHover = isPointInOptimizedButton(x, y, state.toolbarElements.bufferButtonRect);
-    bool newRestoreHover = isPointInOptimizedButton(x, y, state.toolbarElements.restoreButtonRect);
-    bool newMinimizeHover = isPointInOptimizedButton(x, y, state.toolbarElements.minimizeButtonRect);
-    bool newCloseHover = isPointInOptimizedButton(x, y, state.toolbarElements.closeButtonRect);
-    
+    bool newModeHover = false;
+    bool newStrokeHover = false;
+    bool newEnglishHover = false;
+    bool newMenuHover = false;
+    bool newBufferHover = false;
+    bool newRestoreHover = false;
+    bool newMinimizeHover = false;
+    bool newCloseHover = false;
+
+    if (state.toolbarClassicModeBadges) {
+        newStrokeHover = isPointInOptimizedButton(x, y, state.toolbarElements.strokeBadgeRect);
+        newEnglishHover = isPointInOptimizedButton(x, y, state.toolbarElements.englishBadgeRect);
+    } else {
+        newModeHover = isPointInOptimizedButton(x, y, state.toolbarElements.modeIndicatorRect);
+        newMenuHover = isPointInOptimizedButton(x, y, state.toolbarElements.menuButtonRect);
+        newBufferHover = isPointInOptimizedButton(x, y, state.toolbarElements.bufferButtonRect);
+        newRestoreHover = isPointInOptimizedButton(x, y, state.toolbarElements.restoreButtonRect);
+        newMinimizeHover = isPointInOptimizedButton(x, y, state.toolbarElements.minimizeButtonRect);
+        newCloseHover = isPointInOptimizedButton(x, y, state.toolbarElements.closeButtonRect);
+    }
+
     bool needRedraw = false;
-    if (newModeHover != state.toolbarElements.modeIndicatorHover || 
+    if (newModeHover != state.toolbarElements.modeIndicatorHover ||
+        newStrokeHover != state.toolbarElements.strokeBadgeHover ||
+        newEnglishHover != state.toolbarElements.englishBadgeHover ||
         newMenuHover != state.toolbarElements.menuButtonHover ||
         newBufferHover != state.toolbarElements.bufferButtonHover ||
-        newRestoreHover != state.toolbarElements.restoreButtonHover || 
-        newMinimizeHover != state.toolbarElements.minimizeButtonHover || 
+        newRestoreHover != state.toolbarElements.restoreButtonHover ||
+        newMinimizeHover != state.toolbarElements.minimizeButtonHover ||
         newCloseHover != state.toolbarElements.closeButtonHover) {
         needRedraw = true;
     }
-    
+
     state.toolbarElements.modeIndicatorHover = newModeHover;
+    state.toolbarElements.strokeBadgeHover = newStrokeHover;
+    state.toolbarElements.englishBadgeHover = newEnglishHover;
     state.toolbarElements.menuButtonHover = newMenuHover;
     state.toolbarElements.bufferButtonHover = newBufferHover;
     state.toolbarElements.restoreButtonHover = newRestoreHover;
@@ -2784,6 +2964,8 @@ void drawInputWindow(HDC hdc, RECT rc, const GlobalState& state) {
 
 // OptimizedUI視窗建立
 bool createOptimizedWindows(HINSTANCE hInstance, GlobalState& state) {
+    int tbW = state.toolbarClassicModeBadges ? MINI_TOOLBAR_WIDTH : TOOLBAR_WIDTH;
+    int tbH = state.toolbarClassicModeBadges ? MINI_TOOLBAR_HEIGHT : TOOLBAR_HEIGHT;
     // 創建主工具列視窗
     state.hWnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW, 
@@ -2792,8 +2974,8 @@ bool createOptimizedWindows(HINSTANCE hInstance, GlobalState& state) {
         WS_POPUP | WS_BORDER, 
         PositionManager::g_toolbarPos.x, 
         PositionManager::g_toolbarPos.y, 
-        TOOLBAR_WIDTH, 
-        TOOLBAR_HEIGHT,
+        tbW, 
+        tbH,
         NULL, NULL, hInstance, NULL
     );
     
@@ -2853,11 +3035,143 @@ void switchToOptimizedUI(GlobalState& state) {
 
 // 注意：switchToClassicUI 已移除，程序现在只使用 OptimizedUI
 
+// 主工具列 ☰ 選單（完整列：左鍵 ☰；迷你列：右鍵於視窗任意處）
+static void trackMainToolbarPopupMenu(HWND hwnd) {
+    HMENU hMenu = CreatePopupMenu();
+    if (!hMenu) {
+        return;
+    }
+    AppendMenu(hMenu, MF_STRING, 1001, L"標點符號選單");
+    AppendMenu(hMenu, MF_STRING, 1002, L"重新載入字碼表");
+    AppendMenu(hMenu, MF_STRING, 1008, L"從GitHub更新字碼表");
+    AppendMenu(hMenu, MF_STRING, 1005, L"重新載入配置");
+    AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+    std::wstring transparencyText = g_state.enableTransparency ? L"✓ 半透明顯示" : L"半透明顯示";
+    AppendMenu(hMenu, MF_STRING, 1007, transparencyText.c_str());
+    std::wstring predictionText = g_state.enableWordPrediction ? L"✓ 聯想字功能" : L"聯想字功能";
+    AppendMenu(hMenu, MF_STRING, 1010, predictionText.c_str());
+    std::wstring strokeSymbolText = g_state.showStrokeSymbols ? L"✓ 筆劃符號：開" : L"筆劃符號：關";
+    AppendMenu(hMenu, MF_STRING, 1011, strokeSymbolText.c_str());
+    AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+    std::wstring bufferTb = g_state.bufferMode ? L"✓ 暫放模式" : L"暫放模式";
+    AppendMenu(hMenu, MF_STRING, 2012, bufferTb.c_str());
+    AppendMenu(hMenu, MF_STRING, 2002, L"重置為滑鼠跟隨");
+    std::wstring miniTbText = g_state.toolbarClassicModeBadges
+        ? L"✓ 縮小顯示工作列"
+        : L"縮小顯示工作列";
+    AppendMenu(hMenu, MF_STRING, 1015, miniTbText.c_str());
+    AppendMenu(hMenu, MF_STRING, 1020, L"最小化到托盤");
+    AppendMenu(hMenu, MF_STRING, 1022, L"關閉輸入法…");
+    AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+    std::wstring pauseText = g_state.imePaused ? L"▶ 啟用輸入法" : L"❚❚ 暫停輸入法";
+    AppendMenu(hMenu, MF_STRING, 1009, pauseText.c_str());
+    AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenu(hMenu, MF_STRING, 1003, L"關於");
+
+    POINT pt;
+    GetCursorPos(&pt);
+
+    g_state.menuShowing = true;
+
+    LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+    bool wasTopmost = (exStyle & WS_EX_TOPMOST) != 0;
+    if (wasTopmost) {
+        SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+
+    SetForegroundWindow(hwnd);
+    MSG msg;
+    for (int i = 0; i < 15; ++i) {
+        if (!PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+            break;
+        }
+        if (msg.message == WM_QUIT) {
+            break;
+        }
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    TPMPARAMS tpmParams = {0};
+    tpmParams.cbSize = sizeof(TPMPARAMS);
+    tpmParams.rcExclude.left = pt.x - 1;
+    tpmParams.rcExclude.top = pt.y - 1;
+    tpmParams.rcExclude.right = pt.x + 1;
+    tpmParams.rcExclude.bottom = pt.y + 1;
+
+    int cmd = TrackPopupMenuEx(hMenu,
+        TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_VERTICAL | TPM_NOANIMATION,
+        pt.x, pt.y, hwnd, &tpmParams);
+
+    g_state.menuShowing = false;
+
+    if (wasTopmost) {
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+
+    PostMessage(hwnd, WM_NULL, 0, 0);
+
+    if (cmd != 0) {
+        PostMessage(hwnd, WM_COMMAND, cmd, 0);
+    }
+
+    DestroyMenu(hMenu);
+}
+
+// 迷你工具列：兩鍵以外的留白／外框區（與 drawOptimizedToolbar 幾何一致），用於拖曳與游標提示
+static bool isPointInMiniToolbarBorderArea(int x, int y, const RECT& clientRc) {
+    if (x < clientRc.left || y < clientRc.top || x >= clientRc.right || y >= clientRc.bottom) {
+        return false;
+    }
+    const int px = MINI_TOOLBAR_PAD;
+    const int py = MINI_TOOLBAR_PAD;
+    const int cw = MINI_TOOLBAR_CELL_W;
+    const int ch = MINI_TOOLBAR_CELL_H;
+    if (x >= px && x < px + 2 * cw && y >= py && y < py + ch) {
+        return false;
+    }
+    return true;
+}
+
 // OptimizedUI主視窗程序
 LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_ERASEBKGND:
             return 1;  // 避免背景擦除造成的閃爍
+
+        case WM_SETCURSOR: {
+            if (g_state.toolbarClassicModeBadges && LOWORD(lp) == HTCLIENT) {
+                POINT pt;
+                GetCursorPos(&pt);
+                ScreenToClient(hwnd, &pt);
+                RECT cr;
+                GetClientRect(hwnd, &cr);
+                if (isPointInMiniToolbarBorderArea(pt.x, pt.y, cr)) {
+                    SetCursor(LoadCursor(NULL, IDC_SIZEALL));
+                    return TRUE;
+                }
+            }
+            break;
+        }
+
+        case WM_NCHITTEST: {
+            if (g_state.toolbarClassicModeBadges) {
+                LRESULT hit = DefWindowProc(hwnd, msg, wp, lp);
+                if (hit == HTCLIENT) {
+                    return HTCLIENT;
+                }
+                POINT pt;
+                pt.x = (int)(short)LOWORD(lp);
+                pt.y = (int)(short)HIWORD(lp);
+                RECT wr;
+                GetWindowRect(hwnd, &wr);
+                if (PtInRect(&wr, pt)) {
+                    return HTCLIENT;
+                }
+                return hit;
+            }
+            break;
+        }
         
 		case WM_DESTROY:
             return handleWindowDestroy(hwnd);
@@ -3096,10 +3410,44 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             EndPaint(hwnd, &ps);
             return 0;
         }
+
+        case WM_RBUTTONDOWN: {
+            int x = LOWORD(lp);
+            int y = HIWORD(lp);
+            if (g_state.toolbarClassicModeBadges) {
+                RECT crc;
+                GetClientRect(hwnd, &crc);
+                if (x >= crc.left && x < crc.right && y >= crc.top && y < crc.bottom) {
+                    trackMainToolbarPopupMenu(hwnd);
+                    return 0;
+                }
+            }
+            return DefWindowProc(hwnd, msg, wp, lp);
+        }
             
         case WM_LBUTTONDOWN: {
             int x = LOWORD(lp); 
             int y = HIWORD(lp);
+
+            if (g_state.toolbarClassicModeBadges) {
+                if (isPointInOptimizedButton(x, y, g_state.toolbarElements.strokeBadgeRect)) {
+                    InputHandler::setChineseInputMode(g_state, true);
+                    return 0;
+                }
+                if (isPointInOptimizedButton(x, y, g_state.toolbarElements.englishBadgeRect)) {
+                    InputHandler::setChineseInputMode(g_state, false);
+                    return 0;
+                }
+                g_state.dragState.isToolbarDragging = true;
+                SetCapture(hwnd);
+                POINT pt;
+                GetCursorPos(&pt);
+                RECT toolbarRect;
+                GetWindowRect(hwnd, &toolbarRect);
+                g_state.dragState.dragOffset.x = pt.x - toolbarRect.left;
+                g_state.dragState.dragOffset.y = pt.y - toolbarRect.top;
+                return 0;
+            }
             
             // OptimizedUI按鈕點擊檢測
             if (isPointInOptimizedButton(x, y, g_state.toolbarElements.closeButtonRect)) {
@@ -3115,78 +3463,7 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             
             if (isPointInOptimizedButton(x, y, g_state.toolbarElements.menuButtonRect)) {
-                HMENU hMenu = CreatePopupMenu();
-                AppendMenu(hMenu, MF_STRING, 1001, L"標點符號選單");
-                AppendMenu(hMenu, MF_STRING, 1002, L"重新載入字碼表");
-                AppendMenu(hMenu, MF_STRING, 1008, L"從GitHub更新字碼表");
-                AppendMenu(hMenu, MF_STRING, 1005, L"重新載入配置");
-                AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
-                std::wstring transparencyText = g_state.enableTransparency ? L"✓ 半透明顯示" : L"半透明顯示";
-                AppendMenu(hMenu, MF_STRING, 1007, transparencyText.c_str());
-                std::wstring predictionText = g_state.enableWordPrediction ? L"✓ 聯想字功能" : L"聯想字功能";
-                AppendMenu(hMenu, MF_STRING, 1010, predictionText.c_str());
-                std::wstring strokeSymbolText = g_state.showStrokeSymbols ? L"✓ 筆劃符號：開" : L"筆劃符號：關";
-                AppendMenu(hMenu, MF_STRING, 1011, strokeSymbolText.c_str());
-                AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
-                // 暫停/啟用輸入法功能
-                std::wstring pauseText = g_state.imePaused ? L"▶ 啟用輸入法" : L"❚❚ 暫停輸入法";
-                AppendMenu(hMenu, MF_STRING, 1009, pauseText.c_str());
-                AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
-                AppendMenu(hMenu, MF_STRING, 1003, L"關於");
-                
-                POINT pt;
-                GetCursorPos(&pt);
-                
-                // 確保選單在頂層顯示，不被視窗遮蓋
-                // 設置標誌，防止計時器在選單顯示時重新設置TOPMOST
-                g_state.menuShowing = true;
-                
-                // 臨時移除窗口的TOPMOST屬性（如果有的話），避免與輸入法頂層功能衝突
-                LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
-                bool wasTopmost = (exStyle & WS_EX_TOPMOST) != 0;
-                if (wasTopmost) {
-                    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                }
-                
-                // 設置窗口為前台窗口
-                SetForegroundWindow(hwnd);
-                // 讓系統完成前景切換與重繪，避免選單初次顯示白屏（滑鼠移過才正常）
-                MSG msg;
-                for (int i = 0; i < 15; ++i) {
-                    if (!PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) break;
-                    if (msg.message == WM_QUIT) break;
-                    TranslateMessage(&msg);
-                    DispatchMessage(&msg);
-                }
-                
-                // 使用TrackPopupMenuEx來更好地控制選單位置和顯示（TPM_NOANIMATION 避免動畫導致初次不繪製）
-                TPMPARAMS tpmParams = {0};
-                tpmParams.cbSize = sizeof(TPMPARAMS);
-                tpmParams.rcExclude.left = pt.x - 1;
-                tpmParams.rcExclude.top = pt.y - 1;
-                tpmParams.rcExclude.right = pt.x + 1;
-                tpmParams.rcExclude.bottom = pt.y + 1;
-                
-                int cmd = TrackPopupMenuEx(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_VERTICAL | TPM_NOANIMATION,
-                                          pt.x, pt.y, hwnd, &tpmParams);
-                
-                // 清除選單顯示標誌
-                g_state.menuShowing = false;
-                
-                // 選單關閉後恢復窗口的TOPMOST狀態（如果原來是TOPMOST）
-                if (wasTopmost) {
-                    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                }
-                
-                // 發送消息確保焦點正確
-                PostMessage(hwnd, WM_NULL, 0, 0);
-                
-                // 處理選單命令
-                if (cmd != 0) {
-                    PostMessage(hwnd, WM_COMMAND, cmd, 0);
-                }
-                
-                DestroyMenu(hMenu);
+                trackMainToolbarPopupMenu(hwnd);
                 return 0;
             }
             
@@ -3234,6 +3511,15 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 int x = LOWORD(lp); 
                 int y = HIWORD(lp);
                 updateOptimizedButtonHover(x, y, g_state);
+                if (g_state.toolbarClassicModeBadges) {
+                    RECT cr;
+                    GetClientRect(hwnd, &cr);
+                    if (isPointInMiniToolbarBorderArea(x, y, cr)) {
+                        SetCursor(LoadCursor(NULL, IDC_SIZEALL));
+                    } else {
+                        SetCursor(LoadCursor(NULL, IDC_ARROW));
+                    }
+                }
                 TRACKMOUSEEVENT tme = {0};
                 tme.cbSize = sizeof(TRACKMOUSEEVENT);
                 tme.dwFlags = TME_LEAVE;
@@ -3244,10 +3530,21 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         
         case WM_MOUSELEAVE: {
+            if (g_state.toolbarClassicModeBadges) {
+                SetCursor(LoadCursor(NULL, IDC_ARROW));
+            }
             // 鼠標離開工具列窗口時，清除所有按鈕的懸停狀態
             bool needRedraw = false;
             if (g_state.toolbarElements.modeIndicatorHover) {
                 g_state.toolbarElements.modeIndicatorHover = false;
+                needRedraw = true;
+            }
+            if (g_state.toolbarElements.strokeBadgeHover) {
+                g_state.toolbarElements.strokeBadgeHover = false;
+                needRedraw = true;
+            }
+            if (g_state.toolbarElements.englishBadgeHover) {
+                g_state.toolbarElements.englishBadgeHover = false;
                 needRedraw = true;
             }
             if (g_state.toolbarElements.menuButtonHover) {

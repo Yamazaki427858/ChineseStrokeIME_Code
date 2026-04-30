@@ -44,6 +44,14 @@ namespace Utils {
         return true;
     }
 
+    bool isStrongContextBreakPunct(const std::wstring& word) {
+        if (word.length() != 1 || !isPunctuation(word)) return false;
+        const wchar_t c = word[0];
+        return c == L'。' || c == L'．' || c == L'.' ||
+               c == L'？' || c == L'?' ||
+               c == L'！' || c == L'!';
+    }
+
     COLORREF parseColorFromString(const std::string& colorStr) {
         if (colorStr.empty()) return RGB(0,0,0);
         
@@ -71,6 +79,9 @@ namespace Utils {
 }
 namespace Utils {
     bool isPointInRect(int x, int y, const RECT& rect) {
+        if (rect.right <= rect.left || rect.bottom <= rect.top) {
+            return false;
+        }
         return (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom);
     }
 }

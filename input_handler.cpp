@@ -11,6 +11,32 @@ extern HHOOK g_hKeyboardHook;
 
 namespace InputHandler {
 
+bool isStrokeLetterVK(const GlobalState& state, DWORD key) {
+    if (!state.useCustomStrokeKeys) {
+        return key == 'U' || key == 'I' || key == 'O' || key == 'J' || key == 'K';
+    }
+    DWORD u = static_cast<DWORD>(state.strokeKeyUVK);
+    DWORD i = static_cast<DWORD>(state.strokeKeyIVK);
+    DWORD o = static_cast<DWORD>(state.strokeKeyOVK);
+    DWORD j = static_cast<DWORD>(state.strokeKeyJVK);
+    DWORD k = static_cast<DWORD>(state.strokeKeyKVK);
+    return (u && key == u) || (i && key == i) || (o && key == o) || (j && key == j) || (k && key == k);
+}
+
+bool isNumpadStrokeVK(const GlobalState& state, DWORD key) {
+    DWORD nu = state.useCustomNumpadStrokeKeys
+        ? static_cast<DWORD>(state.numpadStrokeKeyUVK) : static_cast<DWORD>(VK_NUMPAD7);
+    DWORD ni = state.useCustomNumpadStrokeKeys
+        ? static_cast<DWORD>(state.numpadStrokeKeyIVK) : static_cast<DWORD>(VK_NUMPAD8);
+    DWORD no = state.useCustomNumpadStrokeKeys
+        ? static_cast<DWORD>(state.numpadStrokeKeyOVK) : static_cast<DWORD>(VK_NUMPAD9);
+    DWORD nj = state.useCustomNumpadStrokeKeys
+        ? static_cast<DWORD>(state.numpadStrokeKeyJVK) : static_cast<DWORD>(VK_NUMPAD4);
+    DWORD nk = state.useCustomNumpadStrokeKeys
+        ? static_cast<DWORD>(state.numpadStrokeKeyKVK) : static_cast<DWORD>(VK_NUMPAD5);
+    return key == nu || key == ni || key == no || key == nj || key == nk;
+}
+
 // 確保目標視窗有焦點
 void ensureTargetWindowFocused() {
     HWND hForeground = GetForegroundWindow();
@@ -99,8 +125,22 @@ void sendTextDirectUnicode(const std::wstring& text) {
     }
 }
 
-void toggleInputMode(GlobalState& state) {
-    state.chineseMode = !state.chineseMode;
+void sendBackspaceToForeground() {
+    INPUT inputs[2] = {0};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_BACK;
+    inputs[0].ki.dwFlags = 0;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = VK_BACK;
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(2, inputs, sizeof(INPUT));
+}
+
+void setChineseInputMode(GlobalState& state, bool chinese) {
+    if (state.chineseMode == chinese) {
+        return;
+    }
+    state.chineseMode = chinese;
     state.input.clear();
     state.candidates.clear();
     state.candidateCodes.clear();
@@ -108,34 +148,50 @@ void toggleInputMode(GlobalState& state) {
     state.isInputting = false;
     state.inputError = false;
     state.showPunctMenu = false;
-    // 切換中英文模式時，回到空閒狀態並隱藏所有輸入相關視窗
+    // 切換語言模式：完全中斷聯想前文
+    state.lastSelected.clear();
+    state.lastBigram.clear();
+    state.lastContext.clear();
+    state.pendingUnlearnFromPrediction = false;
     WindowManager::switchMode(state, InputMode::IDLE);
-
-    // 注意：不再使用 IME API，改用鍵盤鉤子直接轉換字母
+    if (state.hCandWnd) ShowWindow(state.hCandWnd, SW_HIDE);
+    if (state.hPredWnd) ShowWindow(state.hPredWnd, SW_HIDE);
+    if (state.hInputWnd) ShowWindow(state.hInputWnd, SW_HIDE);
 
     std::wstring modeMsg = state.chineseMode ? L"中文+全形" : L"英文+半形";
-    Utils::updateStatus(state, L"Shift切換到" + modeMsg + L"模式");
+    Utils::updateStatus(state, L"已切換為" + modeMsg + L"模式");
     if (state.hWnd) InvalidateRect(state.hWnd, nullptr, TRUE);
+}
+
+void toggleInputMode(GlobalState& state) {
+    setChineseInputMode(state, !state.chineseMode);
 }
 
 void handleEnterKeySmartly(GlobalState& state) {
     if (state.bufferMode) {
         if (state.showCand && state.isInputting) {
-            // 如果有候選字，選擇第一個
             Dictionary::selectCandidate(state, 0);
             return;
         } else if (!state.showCand && !state.isInputting && !state.bufferText.empty()) {
-            // 暫放模式下，無候選字且暫放區有內容時，發送內容（恢復原樣）
             BufferManager::sendBufferContent(state);
+            // Enter 發送暫放內容：完全中斷聯想前文
+            state.lastSelected.clear();
+            state.lastBigram.clear();
+            state.lastContext.clear();
+            state.pendingUnlearnFromPrediction = false;
             return;
         }
     } else {
         if (state.showCand && state.isInputting) {
-            // 非暫放模式下有候選字時，選擇第一個
             Dictionary::selectCandidate(state, 0);
             return;
         }
     }
+    // Enter 無候選時視為語境結束，完全中斷聯想前文
+    state.lastSelected.clear();
+    state.lastBigram.clear();
+    state.lastContext.clear();
+    state.pendingUnlearnFromPrediction = false;
 }
 
 std::wstring convertEnglishChar(wchar_t ch, bool toFullWidth) {
@@ -160,18 +216,43 @@ void processStroke(GlobalState& state, DWORD key) {
         return;
     }
     wchar_t inputChar = 0;
-    
-    // 筆劃鍵（固定對應 u i o j k）
-    if (key == 'U' || key == VK_NUMPAD7) {
-        inputChar = L'u';
-    } else if (key == 'I' || key == VK_NUMPAD8) {
-        inputChar = L'i';
-    } else if (key == 'O' || key == VK_NUMPAD9) {
-        inputChar = L'o';
-    } else if (key == 'J' || key == VK_NUMPAD4) {
-        inputChar = L'j';
-    } else if (key == 'K' || key == VK_NUMPAD5) {
-        inputChar = L'k';
+
+    DWORD nkU = state.useCustomNumpadStrokeKeys
+        ? static_cast<DWORD>(state.numpadStrokeKeyUVK) : static_cast<DWORD>(VK_NUMPAD7);
+    DWORD nkI = state.useCustomNumpadStrokeKeys
+        ? static_cast<DWORD>(state.numpadStrokeKeyIVK) : static_cast<DWORD>(VK_NUMPAD8);
+    DWORD nkO = state.useCustomNumpadStrokeKeys
+        ? static_cast<DWORD>(state.numpadStrokeKeyOVK) : static_cast<DWORD>(VK_NUMPAD9);
+    DWORD nkJ = state.useCustomNumpadStrokeKeys
+        ? static_cast<DWORD>(state.numpadStrokeKeyJVK) : static_cast<DWORD>(VK_NUMPAD4);
+    DWORD nkK = state.useCustomNumpadStrokeKeys
+        ? static_cast<DWORD>(state.numpadStrokeKeyKVK) : static_cast<DWORD>(VK_NUMPAD5);
+
+    // 筆劃鍵：字母區 + 小鍵盤五鍵（兩者可分別自訂）
+    if (!state.useCustomStrokeKeys) {
+        if (key == 'U' || key == nkU) {
+            inputChar = L'u';
+        } else if (key == 'I' || key == nkI) {
+            inputChar = L'i';
+        } else if (key == 'O' || key == nkO) {
+            inputChar = L'o';
+        } else if (key == 'J' || key == nkJ) {
+            inputChar = L'j';
+        } else if (key == 'K' || key == nkK) {
+            inputChar = L'k';
+        }
+    } else {
+        if (key == static_cast<DWORD>(state.strokeKeyUVK) || key == nkU) {
+            inputChar = L'u';
+        } else if (key == static_cast<DWORD>(state.strokeKeyIVK) || key == nkI) {
+            inputChar = L'i';
+        } else if (key == static_cast<DWORD>(state.strokeKeyOVK) || key == nkO) {
+            inputChar = L'o';
+        } else if (key == static_cast<DWORD>(state.strokeKeyJVK) || key == nkJ) {
+            inputChar = L'j';
+        } else if (key == static_cast<DWORD>(state.strokeKeyKVK) || key == nkK) {
+            inputChar = L'k';
+        }
     }
     
     // 3+3 模式萬用字元 *（可由設定檔指定按鍵，預設為 L 與 NumPad0）
@@ -354,8 +435,7 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     bool isWildcardKey =
                         key == static_cast<DWORD>(g_state.wildcardKey1VK) ||
                         key == static_cast<DWORD>(g_state.wildcardKey2VK);
-                    bool isStrokeKey = (key == 'U' || key == 'I' || key == 'O' || 
-                                       key == 'J' || key == 'K' || key == 'P' || isWildcardKey);
+                    bool isStrokeKey = (isStrokeLetterVK(g_state, key) || key == 'P' || isWildcardKey);
                     shouldIntercept = !isStrokeKey;
                 } else {
                     // 英文模式：攔截所有字母鍵，統一由本輸入法送英文，避免與 Windows 自帶輸入法衝突
@@ -437,8 +517,11 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 }
 
                 // 只有當輸入法真的需要處理 ESC 時才攔截
-                if (g_state.showCand || g_state.showPunctMenu || g_state.isInputting) {
-                    // 有候選字、標點選單或正在輸入時，由輸入法處理
+                bool inputUiVisible = (g_state.hInputWnd && IsWindowVisible(g_state.hInputWnd)) ||
+                    (g_state.hCandWnd && IsWindowVisible(g_state.hCandWnd)) ||
+                    (g_state.hPredWnd && IsWindowVisible(g_state.hPredWnd));
+                if (g_state.showCand || g_state.showPunctMenu || g_state.isInputting || inputUiVisible) {
+                    // 有候選字、標點選單、正在輸入或浮動視窗仍顯示時，由輸入法處理
                     PostMessage(g_state.hWnd, WM_USER+100, VK_ESCAPE, 0);
                     return 1;
                 }
@@ -482,7 +565,9 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                         (key >= 'A' && key <= 'Z') ||
                         (key >= '0' && key <= '9' && (!g_state.showCand || key == '0')) ||
                         (key >= VK_NUMPAD0 && key <= VK_DIVIDE) ||
-                        (key == 'U' || key == 'I' || key == 'O' || key == 'J' || key == 'K' || key == 'L') ||
+                        (isStrokeLetterVK(g_state, key) ||
+                         key == static_cast<DWORD>(g_state.wildcardKey1VK) ||
+                         key == static_cast<DWORD>(g_state.wildcardKey2VK)) ||
                         (key == VK_OEM_COMMA || key == VK_OEM_PERIOD || key == VK_OEM_2 ||
                          key == VK_OEM_1 || key == VK_OEM_4 || key == VK_OEM_6 || key == VK_OEM_7 ||
                          key == VK_OEM_MINUS || key == VK_OEM_PLUS || key == VK_OEM_5 || key == VK_OEM_3 ||
@@ -571,22 +656,19 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
                 }
                 
-                // NumPad筆劃輸入支援（包含萬用字元 * 對應的小鍵盤鍵）；暫放+中文模式下仍當筆劃
-                bool isNumpadStrokeKey = (key == VK_NUMPAD7 || key == VK_NUMPAD8 || key == VK_NUMPAD9 || 
-                                         key == VK_NUMPAD4 || key == VK_NUMPAD5 || key == VK_NUMPAD0 ||
-                                         key == static_cast<DWORD>(g_state.wildcardKey2VK));
+                // NumPad 筆劃與萬用鍵（第二萬用鍵常為小鍵盤）
+                bool isNumpadStrokeKey = isNumpadStrokeVK(g_state, key) ||
+                                         key == static_cast<DWORD>(g_state.wildcardKey2VK);
                 if (isNumpadStrokeKey && g_state.chineseMode) {
                     PostMessage(g_state.hWnd, WM_USER+100, key, 0);
                     return 1;
                 }
 				
-				// 處理所有 Numpad 鍵：中文模式下 7,8,9,4,5,0 可當筆劃；其餘為數字/運算符寫入暫放
+				// 處理所有 Numpad 鍵：中文模式下筆劃鍵與萬用鍵交給輸入法；其餘寫入暫放
 				if ((key >= VK_NUMPAD0 && key <= VK_DIVIDE)) {
     if (g_state.chineseMode && !g_state.showCand) {
-        bool isStrokeKey = (key == VK_NUMPAD7 || key == VK_NUMPAD8 || 
-                           key == VK_NUMPAD9 || key == VK_NUMPAD4 || 
-                           key == VK_NUMPAD5 || key == VK_NUMPAD0 ||
-                           key == static_cast<DWORD>(g_state.wildcardKey2VK));
+        bool isStrokeKey = isNumpadStrokeVK(g_state, key) ||
+                           key == static_cast<DWORD>(g_state.wildcardKey2VK);
         if (isStrokeKey) {
             PostMessage(g_state.hWnd, WM_USER+100, key, 0);
             return 1;
@@ -639,8 +721,7 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 bool isWildcardKey =
                     key == static_cast<DWORD>(g_state.wildcardKey1VK) ||
                     key == static_cast<DWORD>(g_state.wildcardKey2VK);
-                bool isStrokeKey = (key == 'U' || key == 'I' || key == 'O' ||
-                                    key == 'J' || key == 'K' || key == 'P' || isWildcardKey);
+                bool isStrokeKey = (isStrokeLetterVK(g_state, key) || key == 'P' || isWildcardKey);
                 if (isStrokeKey && g_state.chineseMode) {
                     PostMessage(g_state.hWnd, WM_USER+100, key, 0);
                     return 1;
@@ -840,9 +921,8 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 bool isWildcardKey =
                     key == static_cast<DWORD>(g_state.wildcardKey1VK) ||
                     key == static_cast<DWORD>(g_state.wildcardKey2VK);
-                bool isStrokeKey = (key == 'U' || key == 'I' || key == 'O' || key == 'J' || key == 'K' || key == 'P' || isWildcardKey ||
-                                    key == VK_NUMPAD7 || key == VK_NUMPAD8 || key == VK_NUMPAD9 || 
-                                    key == VK_NUMPAD4 || key == VK_NUMPAD5 || key == VK_NUMPAD0);
+                bool isStrokeKey = (isStrokeLetterVK(g_state, key) || key == 'P' || isWildcardKey ||
+                                    isNumpadStrokeVK(g_state, key));
 
                 bool isPunctKey = (key == VK_OEM_COMMA || key == VK_OEM_PERIOD || key == VK_OEM_2 ||
                        key == VK_OEM_1 || key == VK_OEM_4 || key == VK_OEM_6 || key == VK_OEM_7 ||

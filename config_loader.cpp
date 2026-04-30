@@ -4,6 +4,7 @@
 #include "window_manager.h"
 #include <fstream>
 #include <sstream>
+#include <unordered_set>
 #include <vector>
 
 namespace ConfigLoader {
@@ -36,6 +37,10 @@ static int parseStrokeKeyFromString(const std::string& value) {
     
     // 無法解析時回傳 0 表示忽略
     return 0;
+}
+
+static bool isNumpadVirtualKey(int vk) {
+    return vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9;
 }
 
 // 生成預設配置檔（寫入 user/interfaceconfig.ini）
@@ -137,6 +142,8 @@ static void createDefaultConfigFile(GlobalState& state) {
     fout << "transparency_alpha=100" << std::endl;
     fout << "; 聯想字功能開關（0=關閉，1=開啟）" << std::endl;
     fout << "enable_word_prediction=0" << std::endl;
+    fout << "; 聯想字視窗顯示候選數上限（1-1000，預設 100）" << std::endl;
+    fout << "max_word_predictions=100" << std::endl;
     fout << std::endl;
     fout << "; 候選字選單顯示英文字碼（0=不顯示 預設，1=顯示如 3. 十[ui]）" << std::endl;
     fout << "showCandidateCode=0" << std::endl;
@@ -144,6 +151,8 @@ static void createDefaultConfigFile(GlobalState& state) {
     fout << "showStrokeSymbols=1" << std::endl;
     fout << "; 螢幕模式變更提示（0=靜默處理 預設，1=彈出提示）" << std::endl;
     fout << "showScreenModeNotification=0" << std::endl;
+    fout << "; 縮小顯示工作列（僅劃／E 兩鍵；於列上右鍵開啟選單）（0=關閉 預設）" << std::endl;
+    fout << "toolbarClassicModeBadges=0" << std::endl;
     fout << std::endl;
     fout << "[InputSettings]" << std::endl;
     fout << "; 萬用字元 * 觸發鍵（3+3 模式，支援：A-Z、NumPad0-9）" << std::endl;
@@ -152,6 +161,21 @@ static void createDefaultConfigFile(GlobalState& state) {
     fout << "; 範例：L、H、NumPad0、NumPad1 ..." << std::endl;
     fout << "wildcardKey1=L" << std::endl;
     fout << "wildcardKey2=NumPad0" << std::endl;
+    fout << "; 自訂筆劃五鍵（對應內部 u i o j k；格式同萬用鍵：A-Z、NumPad0-9）" << std::endl;
+    fout << "; enableCustomStrokeKeys=1 時以 strokeKeyU~K 為筆劃字母鍵（與下方 NumPad 自訂分開）" << std::endl;
+    fout << "enableCustomStrokeKeys=0" << std::endl;
+    fout << "strokeKeyU=U" << std::endl;
+    fout << "strokeKeyI=I" << std::endl;
+    fout << "strokeKeyO=O" << std::endl;
+    fout << "strokeKeyJ=J" << std::endl;
+    fout << "strokeKeyK=K" << std::endl;
+    fout << "; 自訂小鍵盤筆劃五鍵（僅 NumPad0~9；enableCustomNumpadStrokeKeys=1 時生效）" << std::endl;
+    fout << "enableCustomNumpadStrokeKeys=0" << std::endl;
+    fout << "numpadStrokeKeyU=NumPad7" << std::endl;
+    fout << "numpadStrokeKeyI=NumPad8" << std::endl;
+    fout << "numpadStrokeKeyO=NumPad9" << std::endl;
+    fout << "numpadStrokeKeyJ=NumPad4" << std::endl;
+    fout << "numpadStrokeKeyK=NumPad5" << std::endl;
     fout << std::endl;
     fout << "[MultiScreenSettings]" << std::endl;
     fout << "; 多螢幕模式變更提示（與 WindowBehavior.showScreenModeNotification 相容）" << std::endl;
@@ -380,12 +404,21 @@ void loadInterfaceConfig(GlobalState& state) {
                     } catch (...) {}
                 } else if (key == "enable_word_prediction") {
                     state.enableWordPrediction = (value == "1" || value == "true");
+                } else if (key == "max_word_predictions") {
+                    try {
+                        int n = std::stoi(value);
+                        if (n >= 1 && n <= 1000) {
+                            state.maxWordPredictions = n;
+                        }
+                    } catch (...) {}
                 } else if (key == "showCandidateCode") {
                     state.showCandidateCode = (value == "1" || value == "true");
                 } else if (key == "showStrokeSymbols") {
                     state.showStrokeSymbols = (value == "1" || value == "true");
                 } else if (key == "showScreenModeNotification") {
                     state.showScreenModeNotification = (value == "1" || value == "true");
+                } else if (key == "toolbarClassicModeBadges") {
+                    state.toolbarClassicModeBadges = (value == "1" || value == "true");
                 }
             } else if (currentSection == "InputSettings") {
                 if (key == "auto_wildcard_length") {
@@ -411,6 +444,60 @@ void loadInterfaceConfig(GlobalState& state) {
                     int vk = parseStrokeKeyFromString(value);
                     if (vk != 0) {
                         state.wildcardKey2VK = vk;
+                    }
+                } else if (key == "enableCustomStrokeKeys") {
+                    state.useCustomStrokeKeys = (value == "1" || value == "true");
+                } else if (key == "strokeKeyU") {
+                    int vk = parseStrokeKeyFromString(value);
+                    if (vk != 0) {
+                        state.strokeKeyUVK = vk;
+                    }
+                } else if (key == "strokeKeyI") {
+                    int vk = parseStrokeKeyFromString(value);
+                    if (vk != 0) {
+                        state.strokeKeyIVK = vk;
+                    }
+                } else if (key == "strokeKeyO") {
+                    int vk = parseStrokeKeyFromString(value);
+                    if (vk != 0) {
+                        state.strokeKeyOVK = vk;
+                    }
+                } else if (key == "strokeKeyJ") {
+                    int vk = parseStrokeKeyFromString(value);
+                    if (vk != 0) {
+                        state.strokeKeyJVK = vk;
+                    }
+                } else if (key == "strokeKeyK") {
+                    int vk = parseStrokeKeyFromString(value);
+                    if (vk != 0) {
+                        state.strokeKeyKVK = vk;
+                    }
+                } else if (key == "enableCustomNumpadStrokeKeys") {
+                    state.useCustomNumpadStrokeKeys = (value == "1" || value == "true");
+                } else if (key == "numpadStrokeKeyU") {
+                    int vk = parseStrokeKeyFromString(value);
+                    if (isNumpadVirtualKey(vk)) {
+                        state.numpadStrokeKeyUVK = vk;
+                    }
+                } else if (key == "numpadStrokeKeyI") {
+                    int vk = parseStrokeKeyFromString(value);
+                    if (isNumpadVirtualKey(vk)) {
+                        state.numpadStrokeKeyIVK = vk;
+                    }
+                } else if (key == "numpadStrokeKeyO") {
+                    int vk = parseStrokeKeyFromString(value);
+                    if (isNumpadVirtualKey(vk)) {
+                        state.numpadStrokeKeyOVK = vk;
+                    }
+                } else if (key == "numpadStrokeKeyJ") {
+                    int vk = parseStrokeKeyFromString(value);
+                    if (isNumpadVirtualKey(vk)) {
+                        state.numpadStrokeKeyJVK = vk;
+                    }
+                } else if (key == "numpadStrokeKeyK") {
+                    int vk = parseStrokeKeyFromString(value);
+                    if (isNumpadVirtualKey(vk)) {
+                        state.numpadStrokeKeyKVK = vk;
                     }
                 }
             } else if (currentSection == "MultiScreenSettings") {
@@ -466,7 +553,11 @@ void saveInterfaceConfig(const GlobalState& state) {
     bool foundEnableTransparency = false;
     bool foundTransparencyAlpha = false;
     bool foundEnableWordPrediction = false;
+    bool foundMaxWordPredictions = false;
     bool foundShowStrokeSymbols = false;
+    bool foundToolbarClassicModeBadges = false;
+    bool foundEnableCustomStrokeKeys = false;
+    bool foundEnableCustomNumpadStrokeKeys = false;
     std::string currentSection = "";
     int configFileAlpha = state.transparencyAlpha;  // 默认使用state中的值
     
@@ -521,9 +612,30 @@ void saveInterfaceConfig(const GlobalState& state) {
                         lines.push_back("enable_word_prediction=" + (state.enableWordPrediction ? std::string("1") : std::string("0")));
                         foundEnableWordPrediction = true;
                         continue;
+                    } else if (key == "max_word_predictions") {
+                        int n = state.maxWordPredictions;
+                        if (n < 1) n = 1;
+                        if (n > 1000) n = 1000;
+                        lines.push_back("max_word_predictions=" + std::to_string(n));
+                        foundMaxWordPredictions = true;
+                        continue;
                     } else if (key == "showStrokeSymbols") {
                         lines.push_back("showStrokeSymbols=" + (state.showStrokeSymbols ? std::string("1") : std::string("0")));
                         foundShowStrokeSymbols = true;
+                        continue;
+                    } else if (key == "toolbarClassicModeBadges") {
+                        lines.push_back("toolbarClassicModeBadges=" + (state.toolbarClassicModeBadges ? std::string("1") : std::string("0")));
+                        foundToolbarClassicModeBadges = true;
+                        continue;
+                    }
+                } else if (currentSection == "InputSettings") {
+                    if (key == "enableCustomStrokeKeys") {
+                        lines.push_back("enableCustomStrokeKeys=" + (state.useCustomStrokeKeys ? std::string("1") : std::string("0")));
+                        foundEnableCustomStrokeKeys = true;
+                        continue;
+                    } else if (key == "enableCustomNumpadStrokeKeys") {
+                        lines.push_back("enableCustomNumpadStrokeKeys=" + (state.useCustomNumpadStrokeKeys ? std::string("1") : std::string("0")));
+                        foundEnableCustomNumpadStrokeKeys = true;
                         continue;
                     }
                 }
@@ -532,6 +644,57 @@ void saveInterfaceConfig(const GlobalState& state) {
             lines.push_back(line);
         }
         fin.close();
+    }
+
+    if (!foundEnableCustomStrokeKeys) {
+        for (size_t i = 0; i < lines.size(); ++i) {
+            std::string trimmedLine = lines[i];
+            trimmedLine.erase(0, trimmedLine.find_first_not_of(" \t\r\n"));
+            trimmedLine.erase(trimmedLine.find_last_not_of(" \t\r\n") + 1);
+            if (trimmedLine == "[InputSettings]") {
+                lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(i) + 1,
+                    "enableCustomStrokeKeys=" + (state.useCustomStrokeKeys ? std::string("1") : std::string("0")));
+                foundEnableCustomStrokeKeys = true;
+                break;
+            }
+        }
+        if (!foundEnableCustomStrokeKeys) {
+            if (!lines.empty() && !lines.back().empty()) {
+                lines.push_back("");
+            }
+            lines.push_back("[InputSettings]");
+            lines.push_back("enableCustomStrokeKeys=" + (state.useCustomStrokeKeys ? std::string("1") : std::string("0")));
+        }
+    }
+
+    if (!foundEnableCustomNumpadStrokeKeys) {
+        auto insertAfterLinePrefix = [&](const std::string& prefix) -> bool {
+            for (size_t i = 0; i < lines.size(); ++i) {
+                std::string trimmedLine = lines[i];
+                trimmedLine.erase(0, trimmedLine.find_first_not_of(" \t\r\n"));
+                trimmedLine.erase(trimmedLine.find_last_not_of(" \t\r\n") + 1);
+                if (trimmedLine.rfind(prefix, 0) == 0) {
+                    lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(i) + 1,
+                        "enableCustomNumpadStrokeKeys=" + (state.useCustomNumpadStrokeKeys ? std::string("1") : std::string("0")));
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (!insertAfterLinePrefix("strokeKeyK=")) {
+            if (!insertAfterLinePrefix("enableCustomStrokeKeys=")) {
+                for (size_t i = 0; i < lines.size(); ++i) {
+                    std::string trimmedLine = lines[i];
+                    trimmedLine.erase(0, trimmedLine.find_first_not_of(" \t\r\n"));
+                    trimmedLine.erase(trimmedLine.find_last_not_of(" \t\r\n") + 1);
+                    if (trimmedLine == "[InputSettings]") {
+                        lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(i) + 1,
+                            "enableCustomNumpadStrokeKeys=" + (state.useCustomNumpadStrokeKeys ? std::string("1") : std::string("0")));
+                        break;
+                    }
+                }
+            }
+        }
     }
     
     // 如果没找到配置项，需要添加到WindowBehavior节
@@ -563,8 +726,17 @@ void saveInterfaceConfig(const GlobalState& state) {
                 if (!foundEnableWordPrediction) {
                     toInsert.push_back("enable_word_prediction=" + (state.enableWordPrediction ? std::string("1") : std::string("0")));
                 }
+                if (!foundMaxWordPredictions) {
+                    int n = state.maxWordPredictions;
+                    if (n < 1) n = 1;
+                    if (n > 1000) n = 1000;
+                    toInsert.push_back("max_word_predictions=" + std::to_string(n));
+                }
                 if (!foundShowStrokeSymbols) {
                     toInsert.push_back("showStrokeSymbols=" + (state.showStrokeSymbols ? std::string("1") : std::string("0")));
+                }
+                if (!foundToolbarClassicModeBadges) {
+                    toInsert.push_back("toolbarClassicModeBadges=" + (state.toolbarClassicModeBadges ? std::string("1") : std::string("0")));
                 }
                 if (!toInsert.empty()) {
                     lines.insert(lines.begin() + i, toInsert.begin(), toInsert.end());
@@ -596,8 +768,17 @@ void saveInterfaceConfig(const GlobalState& state) {
                 if (!foundEnableWordPrediction) {
                     toInsert.push_back("enable_word_prediction=" + (state.enableWordPrediction ? std::string("1") : std::string("0")));
                 }
+                if (!foundMaxWordPredictions) {
+                    int n = state.maxWordPredictions;
+                    if (n < 1) n = 1;
+                    if (n > 1000) n = 1000;
+                    toInsert.push_back("max_word_predictions=" + std::to_string(n));
+                }
                 if (!foundShowStrokeSymbols) {
                     toInsert.push_back("showStrokeSymbols=" + (state.showStrokeSymbols ? std::string("1") : std::string("0")));
+                }
+                if (!foundToolbarClassicModeBadges) {
+                    toInsert.push_back("toolbarClassicModeBadges=" + (state.toolbarClassicModeBadges ? std::string("1") : std::string("0")));
                 }
                 if (!toInsert.empty()) {
                     lines.insert(lines.begin() + insertPos, toInsert.begin(), toInsert.end());
@@ -622,8 +803,17 @@ void saveInterfaceConfig(const GlobalState& state) {
         if (!foundEnableWordPrediction) {
             toInsert.push_back("enable_word_prediction=" + (state.enableWordPrediction ? std::string("1") : std::string("0")));
         }
+        if (!foundMaxWordPredictions) {
+            int n = state.maxWordPredictions;
+            if (n < 1) n = 1;
+            if (n > 1000) n = 1000;
+            toInsert.push_back("max_word_predictions=" + std::to_string(n));
+        }
         if (!foundShowStrokeSymbols) {
             toInsert.push_back("showStrokeSymbols=" + (state.showStrokeSymbols ? std::string("1") : std::string("0")));
+        }
+        if (!foundToolbarClassicModeBadges) {
+            toInsert.push_back("toolbarClassicModeBadges=" + (state.toolbarClassicModeBadges ? std::string("1") : std::string("0")));
         }
         if (!toInsert.empty()) {
             lines.insert(lines.end(), toInsert.begin(), toInsert.end());
@@ -640,7 +830,14 @@ void saveInterfaceConfig(const GlobalState& state) {
         lines.push_back("enable_transparency=" + (state.enableTransparency ? std::string("1") : std::string("0")));
         lines.push_back("transparency_alpha=" + std::to_string(configFileAlpha));
         lines.push_back("enable_word_prediction=" + (state.enableWordPrediction ? std::string("1") : std::string("0")));
+        {
+            int n = state.maxWordPredictions;
+            if (n < 1) n = 1;
+            if (n > 1000) n = 1000;
+            lines.push_back("max_word_predictions=" + std::to_string(n));
+        }
         lines.push_back("showStrokeSymbols=" + (state.showStrokeSymbols ? std::string("1") : std::string("0")));
+        lines.push_back("toolbarClassicModeBadges=" + (state.toolbarClassicModeBadges ? std::string("1") : std::string("0")));
     }
     
     // 寫回檔案
@@ -697,6 +894,139 @@ void updateTransparencyAlphaFromConfig(GlobalState& state) {
         }
     }
     fin.close();
+}
+
+// [InputSettings] 內與筆劃自訂相關的鍵 → 預設整行（供重設與補齊）
+static std::string defaultLineForStrokeConfigKey(const std::string& key) {
+    if (key == "enableCustomStrokeKeys") return "enableCustomStrokeKeys=0";
+    if (key == "strokeKeyU") return "strokeKeyU=U";
+    if (key == "strokeKeyI") return "strokeKeyI=I";
+    if (key == "strokeKeyO") return "strokeKeyO=O";
+    if (key == "strokeKeyJ") return "strokeKeyJ=J";
+    if (key == "strokeKeyK") return "strokeKeyK=K";
+    if (key == "enableCustomNumpadStrokeKeys") return "enableCustomNumpadStrokeKeys=0";
+    if (key == "numpadStrokeKeyU") return "numpadStrokeKeyU=NumPad7";
+    if (key == "numpadStrokeKeyI") return "numpadStrokeKeyI=NumPad8";
+    if (key == "numpadStrokeKeyO") return "numpadStrokeKeyO=NumPad9";
+    if (key == "numpadStrokeKeyJ") return "numpadStrokeKeyJ=NumPad4";
+    if (key == "numpadStrokeKeyK") return "numpadStrokeKeyK=NumPad5";
+    return "";
+}
+
+void resetStrokeKeysToDefaults(GlobalState& state) {
+    state.useCustomStrokeKeys = false;
+    state.strokeKeyUVK = 'U';
+    state.strokeKeyIVK = 'I';
+    state.strokeKeyOVK = 'O';
+    state.strokeKeyJVK = 'J';
+    state.strokeKeyKVK = 'K';
+    state.useCustomNumpadStrokeKeys = false;
+    state.numpadStrokeKeyUVK = VK_NUMPAD7;
+    state.numpadStrokeKeyIVK = VK_NUMPAD8;
+    state.numpadStrokeKeyOVK = VK_NUMPAD9;
+    state.numpadStrokeKeyJVK = VK_NUMPAD4;
+    state.numpadStrokeKeyKVK = VK_NUMPAD5;
+
+    std::string pathNarrow = Utils::wstrToUtf8(state.userDir + L"interfaceconfig.ini");
+    std::ifstream fin(pathNarrow);
+    if (!fin.is_open()) {
+        Utils::updateStatus(state, L"筆劃鍵已回復預設（未找到 interfaceconfig.ini，僅記憶體）");
+        return;
+    }
+
+    std::vector<std::string> lines;
+    std::string line;
+    std::string currentSection;
+    std::unordered_set<std::string> present;
+
+    while (std::getline(fin, line)) {
+        std::string trimmedLine = line;
+        trimmedLine.erase(0, trimmedLine.find_first_not_of(" \t\r\n"));
+        trimmedLine.erase(trimmedLine.find_last_not_of(" \t\r\n") + 1);
+
+        if (trimmedLine.length() > 0 && trimmedLine[0] == '[' && trimmedLine.back() == ']') {
+            currentSection = trimmedLine.substr(1, trimmedLine.length() - 2);
+            lines.push_back(line);
+            continue;
+        }
+
+        size_t eqPos = trimmedLine.find('=');
+        if (eqPos != std::string::npos && currentSection == "InputSettings") {
+            std::string key = trimmedLine.substr(0, eqPos);
+            key.erase(0, key.find_first_not_of(" \t"));
+            key.erase(key.find_last_not_of(" \t") + 1);
+            std::string defLine = defaultLineForStrokeConfigKey(key);
+            if (!defLine.empty()) {
+                lines.push_back(defLine);
+                present.insert(key);
+                continue;
+            }
+        }
+
+        lines.push_back(line);
+    }
+    fin.close();
+
+    static const char* kOrderedKeys[] = {
+        "enableCustomStrokeKeys",
+        "strokeKeyU", "strokeKeyI", "strokeKeyO", "strokeKeyJ", "strokeKeyK",
+        "enableCustomNumpadStrokeKeys",
+        "numpadStrokeKeyU", "numpadStrokeKeyI", "numpadStrokeKeyO", "numpadStrokeKeyJ", "numpadStrokeKeyK"
+    };
+
+    size_t inputSettingsIdx = static_cast<size_t>(-1);
+    size_t lastManagedInSection = static_cast<size_t>(-1);
+    currentSection.clear();
+    for (size_t i = 0; i < lines.size(); ++i) {
+        std::string trimmedLine = lines[i];
+        trimmedLine.erase(0, trimmedLine.find_first_not_of(" \t\r\n"));
+        trimmedLine.erase(trimmedLine.find_last_not_of(" \t\r\n") + 1);
+        if (trimmedLine.length() > 0 && trimmedLine[0] == '[' && trimmedLine.back() == ']') {
+            currentSection = trimmedLine.substr(1, trimmedLine.length() - 2);
+            if (currentSection == "InputSettings") {
+                inputSettingsIdx = i;
+            } else if (inputSettingsIdx != static_cast<size_t>(-1) && currentSection != "InputSettings") {
+                break;
+            }
+            continue;
+        }
+        if (currentSection != "InputSettings") {
+            continue;
+        }
+        size_t eqPos = trimmedLine.find('=');
+        if (eqPos != std::string::npos) {
+            std::string key = trimmedLine.substr(0, eqPos);
+            key.erase(0, key.find_first_not_of(" \t"));
+            key.erase(key.find_last_not_of(" \t") + 1);
+            if (!defaultLineForStrokeConfigKey(key).empty()) {
+                lastManagedInSection = i;
+            }
+        }
+    }
+
+    if (inputSettingsIdx != static_cast<size_t>(-1)) {
+        size_t insertPos = (lastManagedInSection == static_cast<size_t>(-1))
+            ? inputSettingsIdx + 1
+            : lastManagedInSection + 1;
+        for (const char* k : kOrderedKeys) {
+            std::string ks(k);
+            if (present.find(ks) == present.end()) {
+                lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(insertPos), defaultLineForStrokeConfigKey(ks));
+                insertPos++;
+            }
+        }
+    }
+
+    std::ofstream fout(pathNarrow);
+    if (fout.is_open()) {
+        for (const auto& l : lines) {
+            fout << l << std::endl;
+        }
+        fout.close();
+        Utils::updateStatus(state, L"筆劃鍵已回復預設並寫入 interfaceconfig.ini");
+    } else {
+        Utils::updateStatus(state, L"筆劃鍵已回復預設（無法寫入設定檔）");
+    }
 }
 
 } // namespace ConfigLoader

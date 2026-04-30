@@ -30,6 +30,8 @@ namespace Dictionary {
     
     // 學習功能
     void learnWord(GlobalState& state, const std::wstring& word);
+    /// 聯想字選錯後按 Backspace：扣回剛學的 contextLearning 並還原前文狀態
+    void unlearnFromLastPrediction(GlobalState& state);
     double getWordScore(const GlobalState& state, const std::wstring& word, const std::wstring& code);
     double calculateTimeWeight(time_t lastUsed);
     

@@ -8,6 +8,23 @@
 #include <windows.h>
 namespace BufferManager {
 
+static const size_t MAX_BUFFER_FILE_BYTES = 2 * 1024 * 1024;   // 防止誤讀到大型二進位檔
+static const size_t MAX_BUFFER_TEXT_CHARS = 200000;            // 防止異常內容撐爆 UI
+
+static bool decodeUtf8Strict(const std::string& utf8, std::wstring& out) {
+    out.clear();
+    if (utf8.empty()) return true;
+
+    int required = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+        utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+    if (required <= 0) return false;
+
+    out.assign(required, L'\0');
+    int converted = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+        utf8.data(), static_cast<int>(utf8.size()), &out[0], required);
+    return converted == required;
+}
+
 int calculateBufferWindowHeight(const GlobalState& state) {
     // 确保最小高度足够容纳控制列和按钮
     int minRequiredHeight = 60 + CONTROL_BAR_HEIGHT; // 60px文字区域 + 控制列
@@ -53,6 +70,14 @@ void loadBufferFromFile(GlobalState& state) {
             std::string content((std::istreambuf_iterator<char>(file)),
                               std::istreambuf_iterator<char>());
             file.close();
+
+            if (content.size() > MAX_BUFFER_FILE_BYTES) {
+                state.bufferText.clear();
+                state.bufferCursorPos = 0;
+                saveBufferToFile(state);  // 清掉疑似誤寫入的大型檔案
+                Utils::updateStatus(state, L"偵測到異常暫放檔案，已自動清空");
+                return;
+            }
             
             if (content.length() >= 3 && 
                 content[0] == static_cast<char>(0xEF) &&
@@ -60,8 +85,17 @@ void loadBufferFromFile(GlobalState& state) {
                 content[2] == static_cast<char>(0xBF)) {
                 content = content.substr(3);
             }
-            
-            state.bufferText = Utils::utf8ToWstr(content);
+
+            std::wstring decoded;
+            if (!decodeUtf8Strict(content, decoded) || decoded.size() > MAX_BUFFER_TEXT_CHARS) {
+                state.bufferText.clear();
+                state.bufferCursorPos = 0;
+                saveBufferToFile(state);  // 清掉非 UTF-8/異常內容，避免每次啟動都壞掉
+                Utils::updateStatus(state, L"暫放內容格式異常，已自動重置");
+                return;
+            }
+
+            state.bufferText = decoded;
             state.bufferCursorPos = state.bufferText.length();
         }
     } catch (...) {}
