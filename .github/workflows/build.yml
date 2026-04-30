@@ -7,6 +7,8 @@ on:
       - 'v*'
   pull_request:
     branches: [ "main" ]
+  release:
+    types: [published]
 
 permissions:
   contents: write
@@ -16,7 +18,10 @@ jobs:
     runs-on: windows-latest
 
     steps:
+    # release 事件時務必對準該版本的 tag；push / PR 沿用預設 ref
     - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
 
     - name: Setup MSYS2
       uses: msys2/setup-msys2@v2
@@ -32,9 +37,9 @@ jobs:
       run: |
         mingw32-make
 
-    # 修改：PowerShell 打包成zip
+    # 僅在有對應版本 tag 時打包（push tag、或在網頁發布 Release）
     - name: Package Release
-      if: startsWith(github.ref, 'refs/tags/')
+      if: github.ref_type == 'tag'
       shell: pwsh
       run: |
         New-Item -ItemType Directory -Path ChineseStrokeIME
@@ -48,10 +53,20 @@ jobs:
         name: ChineseStrokeIME-Build
         path: ChineseStrokeIME.exe
 
-    - name: Create Release
-      if: startsWith(github.ref, 'refs/tags/')
+    # 由 git push tag 觸發時：建立 Release 並附上 zip（軟體預設流程）
+    - name: Create Release (git tag push)
+      if: github.event_name == 'push' && github.ref_type == 'tag'
       uses: softprops/action-gh-release@v3
       with:
         files: ChineseStrokeIME_Release.zip
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    # 由網頁「發布 Release」觸發時：Release 已存在，只上傳／覆寫資產（避免與上一段重複 create）
+    - name: Upload to Release (published from GitHub UI)
+      if: github.event_name == 'release'
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh release upload "${{ github.event.release.tag_name }}" ChineseStrokeIME_Release.zip --clobber
