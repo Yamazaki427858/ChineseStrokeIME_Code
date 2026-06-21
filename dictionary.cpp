@@ -60,7 +60,13 @@ std::wstring getInputDisplay(const GlobalState& state) {
     std::wstring display = state.input;
     
     if (state.showPunctMenu) {
-        display = L"標點符號選單";
+        if (state.punctMenuMode == PunctMenuMode::EMOJI &&
+            state.emojiGroupIndex >= 0 &&
+            state.emojiGroupIndex < (int)state.emojiGroups.size()) {
+            display = L"Emoji：" + state.emojiGroups[state.emojiGroupIndex].label;
+        } else {
+            display = L"標點符號選單";
+        }
     } else if (!state.input.empty()) {
         std::wstring filtered = filterValidChars(state.input);
         std::wstring displayable = state.showStrokeSymbols ? convertToStrokeSymbols(filtered) : filtered;
@@ -499,6 +505,291 @@ void loadPunctMenu(GlobalState& state) {
     Utils::updateStatus(state, L"使用內建標點符號選單：" + std::to_wstring(state.punctCandidates.size()) + L" 個符號");
 }
 
+namespace {
+
+std::string readFileUtf8(const std::wstring& path) {
+    std::ifstream fin(Utils::wstrToUtf8(path), std::ios::in | std::ios::binary);
+    if (!fin.is_open()) return "";
+    return std::string((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
+}
+
+void stripUtf8Bom(std::string& content) {
+    if (content.size() >= 3 &&
+        static_cast<unsigned char>(content[0]) == 0xEF &&
+        static_cast<unsigned char>(content[1]) == 0xBB &&
+        static_cast<unsigned char>(content[2]) == 0xBF) {
+        content = content.substr(3);
+    }
+}
+
+std::wstring jsonStringAfter(const std::string& json, const char* key, size_t fromPos) {
+    std::string pattern = std::string("\"") + key + "\"";
+    size_t pos = json.find(pattern, fromPos);
+    if (pos == std::string::npos) return L"";
+    pos = json.find(':', pos);
+    if (pos == std::string::npos) return L"";
+    pos = json.find('"', pos + 1);
+    if (pos == std::string::npos) return L"";
+    size_t end = pos + 1;
+    while (end < json.size()) {
+        if (json[end] == '"' && json[end - 1] != '\\') break;
+        ++end;
+    }
+    try {
+        return Utils::utf8ToWstr(json.substr(pos + 1, end - pos - 1));
+    } catch (...) {
+        return L"";
+    }
+}
+
+int jsonIntAfter(const std::string& json, const char* key, size_t fromPos, int defaultVal) {
+    std::string pattern = std::string("\"") + key + "\"";
+    size_t pos = json.find(pattern, fromPos);
+    if (pos == std::string::npos) return defaultVal;
+    pos = json.find(':', pos);
+    if (pos == std::string::npos) return defaultVal;
+    ++pos;
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
+    size_t end = pos;
+    while (end < json.size() && (json[end] == '-' || (json[end] >= '0' && json[end] <= '9'))) ++end;
+    if (end == pos) return defaultVal;
+    try {
+        return std::stoi(json.substr(pos, end - pos));
+    } catch (...) {
+        return defaultVal;
+    }
+}
+
+std::vector<std::wstring> parseEmojiJsonEntries(const std::string& json) {
+    std::vector<std::wstring> result;
+    size_t pos = 0;
+    while ((pos = json.find("\"e\"", pos)) != std::string::npos) {
+        pos = json.find(':', pos);
+        if (pos == std::string::npos) break;
+        pos = json.find('"', pos + 1);
+        if (pos == std::string::npos) break;
+        size_t end = pos + 1;
+        while (end < json.size()) {
+            if (json[end] == '"' && json[end - 1] != '\\') break;
+            ++end;
+        }
+        try {
+            std::wstring e = Utils::utf8ToWstr(json.substr(pos + 1, end - pos - 1));
+            if (!e.empty()) result.push_back(e);
+        } catch (...) {}
+        pos = end + 1;
+    }
+    return result;
+}
+
+bool parseEmojiManifest(const std::string& json, GlobalState& state) {
+    if (json.find("\"format\"") == std::string::npos) return false;
+    state.emojiDataVersion = jsonStringAfter(json, "version", 0);
+    state.emojiGridCols = jsonIntAfter(json, "cols", json.find("\"grid\""), EMOJI_GRID_COLS);
+    state.emojiGridRows = jsonIntAfter(json, "rows", json.find("\"grid\""), EMOJI_GRID_ROWS);
+    if (state.emojiGridCols < 4) state.emojiGridCols = EMOJI_GRID_COLS;
+    if (state.emojiGridRows < 3) state.emojiGridRows = EMOJI_GRID_ROWS;
+
+    state.emojiGroups.clear();
+    size_t pos = 0;
+    while ((pos = json.find("\"slug\"", pos)) != std::string::npos) {
+        EmojiGroup g;
+        g.slug = jsonStringAfter(json, "slug", pos);
+        g.label = jsonStringAfter(json, "label_zh", pos);
+        g.icon = jsonStringAfter(json, "icon", pos);
+        g.file = jsonStringAfter(json, "file", pos);
+        g.count = jsonIntAfter(json, "count", pos, 0);
+        if (!g.slug.empty() && !g.file.empty()) {
+            state.emojiGroups.push_back(g);
+        }
+        pos += 6;
+    }
+    return !state.emojiGroups.empty();
+}
+
+bool emojiDataComplete(const GlobalState& state) {
+    std::wstring emojiDir = state.userDir + L"emoji\\";
+    std::string content = readFileUtf8(emojiDir + L"manifest.json");
+    if (content.empty()) return false;
+    stripUtf8Bom(content);
+    GlobalState probe;
+    probe.userDir = state.userDir;
+    if (!parseEmojiManifest(content, probe)) return false;
+    for (const EmojiGroup& g : probe.emojiGroups) {
+        std::ifstream fin(Utils::wstrToUtf8(emojiDir + g.file));
+        if (!fin.is_open()) return false;
+    }
+    return true;
+}
+
+void loadEmojiGroupsFromDisk(GlobalState& state) {
+    std::wstring emojiDir = state.userDir + L"emoji\\";
+    CreateDirectoryW(emojiDir.c_str(), NULL);
+
+    state.emojiGroups.clear();
+    std::string content = readFileUtf8(emojiDir + L"manifest.json");
+    if (content.empty()) return;
+    stripUtf8Bom(content);
+    if (!parseEmojiManifest(content, state)) return;
+
+    int groupIndex = state.emojiGroupIndex;
+    if (groupIndex < 0 || groupIndex >= (int)state.emojiGroups.size()) {
+        groupIndex = 0;
+    }
+    if (!state.emojiGroups.empty()) {
+        applyEmojiGroupDisplay(state, groupIndex);
+    }
+}
+
+} // namespace
+
+bool loadEmojiGroupAt(GlobalState& state, int groupIndex) {
+    if (groupIndex < 0 || groupIndex >= (int)state.emojiGroups.size()) return false;
+    EmojiGroup& g = state.emojiGroups[groupIndex];
+    if (g.loaded) return true;
+
+    std::wstring path = state.userDir + L"emoji\\" + g.file;
+    std::string content = readFileUtf8(path);
+    if (content.empty()) {
+        if (updateEmojiFromGitHub(state, false)) {
+            g.loaded = false;
+            return loadEmojiGroupAt(state, groupIndex);
+        }
+        return false;
+    }
+    stripUtf8Bom(content);
+    g.emojis = parseEmojiJsonEntries(content);
+    if (g.emojis.empty()) return false;
+    g.loaded = true;
+    g.count = (int)g.emojis.size();
+    return true;
+}
+
+void applyEmojiGroupDisplay(GlobalState& state, int groupIndex) {
+    if (!loadEmojiGroupAt(state, groupIndex)) return;
+    state.emojiGroupIndex = groupIndex;
+    state.candidates = state.emojiGroups[groupIndex].emojis;
+    state.candidateCodes.clear();
+    state.selected = 0;
+    state.currentPage = 0;
+    state.hoverCandidateIndex = -1;
+    state.emojiHoverCell = -1;
+    int perPage = state.emojiGridCols * state.emojiGridRows;
+    state.totalPages = perPage > 0
+        ? (int)((state.candidates.size() + perPage - 1) / perPage)
+        : 0;
+    if (state.totalPages < 1) state.totalPages = 1;
+}
+
+void loadEmojiGroups(GlobalState& state) {
+    std::wstring emojiDir = state.userDir + L"emoji\\";
+    CreateDirectoryW(emojiDir.c_str(), NULL);
+
+    if (!emojiDataComplete(state)) {
+        Utils::updateStatus(state, L"Emoji 資料不存在或不完整，嘗試從 GitHub 下載…");
+        if (state.hWnd) {
+            InvalidateRect(state.hWnd, nullptr, TRUE);
+            UpdateWindow(state.hWnd);
+        }
+        if (!updateEmojiFromGitHub(state, true)) {
+            Utils::updateStatus(state, L"無法載入 Emoji 資料（請檢查網路，或從托盤選單手動更新）");
+        }
+        return;
+    }
+
+    loadEmojiGroupsFromDisk(state);
+    if (!state.emojiGroups.empty()) {
+        Utils::updateStatus(state, L"已載入 Emoji 資料：" + std::to_wstring(state.emojiGroups.size()) + L" 類");
+    }
+}
+
+void selectEmoji(GlobalState& state, const std::wstring& emoji) {
+    if (emoji.empty()) return;
+    if (state.bufferMode) {
+        BufferManager::insertTextAtCursor(state, emoji);
+        Utils::updateStatus(state, L"已插入 " + emoji + L"（Emoji 選單仍開啟，ESC 關閉）");
+    } else {
+        InputHandler::sendTextDirectUnicode(emoji);
+        Utils::updateStatus(state, L"已插入 " + emoji + L"（ESC 關閉選單）");
+    }
+    if (state.hCandWnd) InvalidateRect(state.hCandWnd, nullptr, TRUE);
+}
+
+bool updateEmojiFromGitHub(GlobalState& state, bool showProgress) {
+    if (showProgress) {
+        Utils::updateStatus(state, L"正在從 GitHub 下載 Emoji 資料…");
+        if (state.hWnd) {
+            InvalidateRect(state.hWnd, nullptr, TRUE);
+            UpdateWindow(state.hWnd);
+        }
+    }
+
+    const char* baseUrl =
+        "https://raw.githubusercontent.com/Yamazaki427858/ChineseStrokeIME/ChineseStrokeIME/SourceCode/emoji/";
+    std::wstring emojiDir = state.userDir + L"emoji\\";
+    CreateDirectoryW(emojiDir.c_str(), NULL);
+
+    std::string manifestLocal = Utils::wstrToUtf8(emojiDir + L"manifest.json");
+    std::string manifestTmp = manifestLocal + ".tmp";
+    std::string manifestUrl = std::string(baseUrl) + "manifest.json";
+
+    DictUpdater::DownloadResult r = DictUpdater::downloadFromGitHub(manifestUrl.c_str(), manifestTmp.c_str());
+    if (r.status != DictUpdater::DownloadStatus::Success) {
+        Utils::updateStatus(state, L"✗ Emoji manifest 下載失敗");
+        return false;
+    }
+
+    std::string manifestContent;
+    {
+        std::ifstream fin(manifestTmp, std::ios::in | std::ios::binary);
+        if (!fin.is_open()) {
+            Utils::updateStatus(state, L"✗ 無法讀取下載的 manifest");
+            return false;
+        }
+        manifestContent.assign((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
+    }
+
+    GlobalState tempState = state;
+    stripUtf8Bom(manifestContent);
+    if (!parseEmojiManifest(manifestContent, tempState)) {
+        DeleteFileA(manifestTmp.c_str());
+        Utils::updateStatus(state, L"✗ Emoji manifest 格式無效");
+        return false;
+    }
+
+    if (!MoveFileExA(manifestTmp.c_str(), manifestLocal.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileA(manifestTmp.c_str());
+        Utils::updateStatus(state, L"✗ 無法寫入 manifest.json");
+        return false;
+    }
+
+    for (const EmojiGroup& g : tempState.emojiGroups) {
+        std::string url = std::string(baseUrl) + Utils::wstrToUtf8(g.file);
+        std::string local = Utils::wstrToUtf8(emojiDir + g.file);
+        std::string tmp = local + ".tmp";
+        r = DictUpdater::downloadFromGitHub(url.c_str(), tmp.c_str());
+        if (r.status != DictUpdater::DownloadStatus::Success) {
+            Utils::updateStatus(state, L"✗ 下載失敗：" + g.file);
+            return false;
+        }
+        if (!MoveFileExA(tmp.c_str(), local.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            DeleteFileA(tmp.c_str());
+            Utils::updateStatus(state, L"✗ 無法寫入：" + g.file);
+            return false;
+        }
+    }
+
+    loadEmojiGroupsFromDisk(state);
+    if (!state.emojiGroups.empty()) {
+        Utils::updateStatus(state, L"✓ Emoji 資料已更新（" + state.emojiDataVersion + L"，" +
+                          std::to_wstring(state.emojiGroups.size()) + L" 類）");
+    } else {
+        Utils::updateStatus(state, L"✓ Emoji 資料已下載，但載入失敗");
+    }
+    if (state.hWnd) InvalidateRect(state.hWnd, nullptr, TRUE);
+    return true;
+}
+
 void loadUserDict(GlobalState& state) {
     state.wordFreq.clear();
     std::ifstream fin(Utils::wstrToUtf8(state.userDir + L"user_dict.txt"));
@@ -561,6 +852,16 @@ void saveUserDict(const GlobalState& state) {
         }
         fout.close();
     } catch (...) {}
+}
+
+bool removeFromUserDict(GlobalState& state, const std::wstring& word) {
+    if (word.empty()) return false;
+    auto it = state.wordFreq.find(word);
+    if (it == state.wordFreq.end()) return false;
+    state.wordFreq.erase(it);
+    saveUserDict(state);
+    Utils::updateStatus(state, L"已從用戶字典刪除：" + word + L"（再次選字可重新學習）");
+    return true;
 }
 
 // 載入智能聯想引擎的個人上下文學習記錄
@@ -1111,8 +1412,8 @@ void selectCandidate(GlobalState& state, int idx) {
         }
     }
     
-    // 如果是標點符號選單，直接結束
-    if (state.showPunctMenu) {
+    // 標點符號選單（非 Emoji）：選取後關閉；Emoji 模式走 selectEmoji，不在此處理
+    if (state.showPunctMenu && state.punctMenuMode == PunctMenuMode::PUNCT) {
         state.input.clear();
         state.candidates.clear();
         state.candidateCodes.clear();

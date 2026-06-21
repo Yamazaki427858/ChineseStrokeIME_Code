@@ -15,20 +15,63 @@ Position g_userCandPos;
 int g_verticalOffset = 25;
 
 static int g_retryCount = 0;
+static bool g_trackingInitialized = false;
+
+static void getToolbarSize(const GlobalState& state, int& w, int& h) {
+    if (state.useOptimizedUI) {
+        w = state.toolbarClassicModeBadges ? MINI_TOOLBAR_WIDTH : TOOLBAR_WIDTH;
+        h = state.toolbarClassicModeBadges ? MINI_TOOLBAR_HEIGHT : TOOLBAR_HEIGHT;
+    } else {
+        w = state.windowWidth;
+        h = state.windowHeight;
+    }
+}
+
+static void invalidateUserPositionsIfOffScreen() {
+    if (!g_useUserPosition) return;
+
+    bool inputValid = g_userInputPos.isValid &&
+        ScreenManager::isPointInAnyMonitor({g_userInputPos.x, g_userInputPos.y});
+    bool candValid = g_userCandPos.isValid &&
+        ScreenManager::isPointInAnyMonitor({g_userCandPos.x, g_userCandPos.y});
+
+    if (!inputValid) g_userInputPos.isValid = false;
+    if (!candValid) g_userCandPos.isValid = false;
+
+    if (!g_userInputPos.isValid && !g_userCandPos.isValid) {
+        g_useUserPosition = false;
+    }
+}
+
+static void moveToolbarToPrimarySafe(GlobalState& state) {
+    ScreenManager::MonitorInfo primary = ScreenManager::getPrimaryMonitor();
+    const RECT& rc = primary.rect;
+    int w = 0, h = 0;
+    getToolbarSize(state, w, h);
+
+    g_toolbarPos.x = rc.left + 50;
+    g_toolbarPos.y = rc.bottom - h - 50;
+    g_toolbarPos.isValid = true;
+
+    if (state.hWnd) {
+        SetWindowPos(state.hWnd, HWND_TOPMOST, g_toolbarPos.x, g_toolbarPos.y, 0, 0,
+                     SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        ShowWindow(state.hWnd, SW_SHOW);
+        InvalidateRect(state.hWnd, nullptr, TRUE);
+        UpdateWindow(state.hWnd);
+    }
+}
+
+void initScreenModeTracking() {
+    ScreenManager::initMonitorTracking();
+    g_trackingInitialized = true;
+    g_retryCount = 0;
+}
 
 POINT getCurrentMousePosition() {
     POINT pos;
     GetCursorPos(&pos);
-    bool inAnyScreen = false;
-    auto monitors = ScreenManager::getMonitors();
-    for (const auto& monitor : monitors) {
-        if (pos.x >= monitor.rect.left && pos.x <= monitor.rect.right &&
-            pos.y >= monitor.rect.top && pos.y <= monitor.rect.bottom) {
-            inAnyScreen = true;
-            break;
-        }
-    }
-    if (!inAnyScreen) {
+    if (!ScreenManager::isPointInAnyMonitor(pos)) {
         ScreenManager::MonitorInfo primary = ScreenManager::getPrimaryMonitor();
         pos.x = primary.rect.left + (primary.rect.right - primary.rect.left) / 2;
         pos.y = primary.rect.top + (primary.rect.bottom - primary.rect.top) / 2;
@@ -62,29 +105,12 @@ bool isPositionVisible(const GlobalState& state) {
     if (!state.hWnd) return false;
     RECT windowRect;
     if (!GetWindowRect(state.hWnd, &windowRect)) return false;
-    auto monitors = ScreenManager::getMonitors();
-    for (const auto& monitor : monitors) {
-        RECT intersection;
-        if (IntersectRect(&intersection, &windowRect, &monitor.rect)) {
-            int windowArea = (windowRect.right - windowRect.left) * (windowRect.bottom - windowRect.top);
-            int intersectionArea = (intersection.right - intersection.left) * (intersection.bottom - intersection.top);
-            if (intersectionArea >= windowArea / 2) return true;
-        }
-    }
-    return false;
+    return ScreenManager::isRectVisibleOnAnyMonitor(windowRect, 50);
 }
 
 void forceResetToSafePosition(GlobalState& state) {
-    ScreenManager::MonitorInfo primary = ScreenManager::getPrimaryMonitor();
-    const RECT& rc = primary.rect;
-    g_toolbarPos.x = rc.left + 50;
-    g_toolbarPos.y = rc.bottom - state.windowHeight - 50;
-    g_toolbarPos.isValid = true;
-    if (state.hWnd) {
-        SetWindowPos(state.hWnd, HWND_TOPMOST, g_toolbarPos.x, g_toolbarPos.y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
-        ShowWindow(state.hWnd, SW_SHOW);
-        SetForegroundWindow(state.hWnd);
-    }
+    moveToolbarToPrimarySafe(state);
+    invalidateUserPositionsIfOffScreen();
     savePositions(state);
     Utils::updateStatus(state, L"工具列已重置到安全位置");
 }
@@ -95,8 +121,10 @@ void loadPositions(GlobalState& state) {
     if (!config.is_open()) {
         ScreenManager::MonitorInfo primary = ScreenManager::getPrimaryMonitor();
         const RECT& rc = primary.rect;
+        int w = 0, h = 0;
+        getToolbarSize(state, w, h);
         g_toolbarPos.x = std::max<int>(rc.left + 50, 50);
-        g_toolbarPos.y = std::max<int>(rc.bottom - state.windowHeight - 50, 50);
+        g_toolbarPos.y = std::max<int>(rc.bottom - h - 50, 50);
         g_toolbarPos.isValid = true;
         savePositions(state);
         return;
@@ -145,6 +173,7 @@ void loadPositions(GlobalState& state) {
     else if (ScreenManager::isMirroredMode() && g_screenModePositions.hasMirroredPos)
         g_toolbarPos = g_screenModePositions.mirroredModePos;
     ensureVisiblePosition(state);
+    invalidateUserPositionsIfOffScreen();
 }
 
 void savePositions(const GlobalState& state) {
@@ -170,46 +199,60 @@ void savePositions(const GlobalState& state) {
 }
 
 void adjustPositionForScreenMode(GlobalState& state) {
-    static bool previousExtended = ScreenManager::isExtendedMode();
-    static bool firstTime = true;
-    if (firstTime) {
-        previousExtended = ScreenManager::isExtendedMode();
-        firstTime = false;
+    if (!g_trackingInitialized) {
+        initScreenModeTracking();
     }
+
     ScreenManager::updateMonitorInfo();
-    bool currentExtended = ScreenManager::isExtendedMode();
+    int previousCount = ScreenManager::getPreviousMonitorCount();
+    int currentCount = ScreenManager::getMonitorCount();
+    bool previousExtended = previousCount > 1;
+    bool currentExtended = currentCount > 1;
+    bool countDecreased = (previousCount >= 0) && (currentCount < previousCount);
     bool modeChanged = (previousExtended != currentExtended);
-    if (modeChanged || g_retryCount > 0) {
-        ScreenManager::MonitorInfo primary = ScreenManager::getPrimaryMonitor();
-        const RECT& rc = primary.rect;
+    bool toolbarVisible = isPositionVisible(state);
+    bool shouldHandle = modeChanged || countDecreased || g_retryCount > 0 || !toolbarVisible;
+
+    if (shouldHandle) {
         if (previousExtended && !currentExtended) {
-            g_toolbarPos.x = rc.left + 50;
-            g_toolbarPos.y = rc.bottom - state.windowHeight - 50;
-            if (state.hWnd) {
-                SetWindowPos(state.hWnd, HWND_TOPMOST, g_toolbarPos.x, g_toolbarPos.y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-                ShowWindow(state.hWnd, SW_SHOW);
-                InvalidateRect(state.hWnd, nullptr, TRUE);
-                UpdateWindow(state.hWnd);
-            }
+            // 延伸 → 單螢幕（例如拔掉所有外接螢幕）
+            moveToolbarToPrimarySafe(state);
+            invalidateUserPositionsIfOffScreen();
             g_retryCount = 0;
             if (modeChanged && state.showScreenModeNotification) {
-                MessageBoxW(NULL, L"偵測到螢幕模式變更：延伸→同步\n工具列已自動移至主螢幕。", L"螢幕模式變更", MB_OK | MB_ICONINFORMATION);
+                MessageBoxW(NULL, L"偵測到螢幕模式變更：延伸→同步\n工具列已自動移至主螢幕。",
+                            L"螢幕模式變更", MB_OK | MB_ICONINFORMATION);
             }
         } else if (!previousExtended && currentExtended) {
+            // 單螢幕 → 延伸
             if (g_screenModePositions.hasExtendedPos) {
                 g_toolbarPos = g_screenModePositions.extendedModePos;
                 ensureVisiblePosition(state);
             }
             g_retryCount = 0;
+        } else if (countDecreased && !toolbarVisible) {
+            // 3→2、4→3 等：螢幕減少且工具列落在已移除的螢幕上
+            moveToolbarToPrimarySafe(state);
+            invalidateUserPositionsIfOffScreen();
+            g_retryCount = 0;
+        } else if (!toolbarVisible) {
+            moveToolbarToPrimarySafe(state);
+            invalidateUserPositionsIfOffScreen();
+        } else if (countDecreased) {
+            // 螢幕減少但工具列仍在有效螢幕上，僅做邊界校正
+            ensureVisiblePosition(state);
         }
+
         savePositions(state);
-        previousExtended = currentExtended;
     }
+
+    ScreenManager::syncMonitorTracking();
+
     if (!isPositionVisible(state)) {
         g_retryCount++;
-        if (g_retryCount <= 3)
+        if (g_retryCount <= 5 && state.hWnd) {
             SetTimer(state.hWnd, 998, 200, NULL);
-        else {
+        } else {
             forceResetToSafePosition(state);
             g_retryCount = 0;
         }
@@ -219,26 +262,22 @@ void adjustPositionForScreenMode(GlobalState& state) {
 }
 
 void ensureVisiblePosition(GlobalState& state) {
-    bool positionValid = false;
-    auto monitors = ScreenManager::getMonitors();
-    for (const auto& monitor : monitors) {
-        const RECT& rc = monitor.rect;
-        if (g_toolbarPos.x >= rc.left && g_toolbarPos.x <= rc.right - state.windowWidth &&
-            g_toolbarPos.y >= rc.top && g_toolbarPos.y <= rc.bottom - state.windowHeight) {
-            positionValid = true;
-            break;
-        }
+    int w = 0, h = 0;
+    getToolbarSize(state, w, h);
+
+    RECT toolbarRect = {
+        g_toolbarPos.x,
+        g_toolbarPos.y,
+        g_toolbarPos.x + w,
+        g_toolbarPos.y + h
+    };
+
+    if (ScreenManager::isRectVisibleOnAnyMonitor(toolbarRect, 50)) {
+        return;
     }
-    if (!positionValid) {
-        ScreenManager::MonitorInfo primary = ScreenManager::getPrimaryMonitor();
-        const RECT& rc = primary.rect;
-        g_toolbarPos.x = rc.left + 50;
-        g_toolbarPos.y = rc.bottom - state.windowHeight - 50;
-        g_toolbarPos.isValid = true;
-        if (state.hWnd)
-            SetWindowPos(state.hWnd, NULL, g_toolbarPos.x, g_toolbarPos.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-        savePositions(state);
-    }
+
+    moveToolbarToPrimarySafe(state);
+    savePositions(state);
 }
 
 } // namespace PositionManager

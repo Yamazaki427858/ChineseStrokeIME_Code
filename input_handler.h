@@ -30,6 +30,8 @@ namespace InputHandler {
     
     // 顯示標點選單
     void showPunctMenu(GlobalState& state);
+    void switchPunctMenuMode(GlobalState& state, PunctMenuMode mode);
+    void closePunctMenu(GlobalState& state);
     
     // 文字發送
     void sendTextDirectUnicode(const std::wstring& text);
@@ -38,6 +40,7 @@ namespace InputHandler {
     
     // 確保目標視窗有焦點（用於文字發送前）
     void ensureTargetWindowFocused();
+    void refreshPunctMenuTargetIfNeeded();
     
     // 英文字元轉換（全形/半形）
     std::wstring convertEnglishChar(wchar_t ch, bool toFullWidth);

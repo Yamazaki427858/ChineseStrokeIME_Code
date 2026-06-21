@@ -28,6 +28,7 @@ static void initDirectories(GlobalState& state) {
 
     CreateDirectoryW(state.systemDir.c_str(), NULL);
     CreateDirectoryW(state.userDir.c_str(), NULL);
+    CreateDirectoryW((state.userDir + L"emoji").c_str(), NULL);
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShowCmd) {
@@ -45,12 +46,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         Dictionary::loadMainDict(g_state);
         Dictionary::loadPunctuator(g_state);
         Dictionary::loadPunctMenu(g_state);
+        Dictionary::loadEmojiGroups(g_state);
         Dictionary::loadUserDict(g_state);
         Dictionary::loadWordPhrases(g_state);  // 載入詞語庫（可選）
         Dictionary::loadContextLearning(g_state);  // 載入智能聯想引擎的個人上下文學習記錄
         
         // 載入位置記憶
         PositionManager::loadPositions(g_state);
+        PositionManager::initScreenModeTracking();
         
         // 設定為OptimizedUI模式
         g_state.useOptimizedUI = true;

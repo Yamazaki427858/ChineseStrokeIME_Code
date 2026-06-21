@@ -26,7 +26,10 @@ namespace WindowManager {
 	
     // 繪製函數
     void drawCandidate(HWND hwnd, HDC hdc, const GlobalState& state);
+    void drawEmojiPicker(HWND hwnd, HDC hdc, GlobalState& state);
     void drawPrediction(HWND hwnd, HDC hdc, const GlobalState& state);
+    bool handleEmojiPickerClick(GlobalState& state, int x, int y);
+    void updateEmojiPickerHover(GlobalState& state, int x, int y);
     void drawBufferWindow(HDC hdc, RECT rc, GlobalState& state);
     
     // OptimizedUI繪製函數
@@ -55,6 +58,7 @@ namespace WindowManager {
     // 統一視窗定位
     void positionMainWindow(GlobalState& state);
     void positionWindowsOptimized(GlobalState& state);
+    void repositionImeWindowsForDisplayChange(GlobalState& state);
     void positionPredictionWindow(GlobalState& state);
     void positionCandidateWindow(GlobalState& state);
     

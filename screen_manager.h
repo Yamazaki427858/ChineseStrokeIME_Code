@@ -19,11 +19,20 @@ namespace ScreenManager {
     std::vector<MonitorInfo> getMonitors();
     MonitorInfo getMonitorFromPoint(POINT pt);
     MonitorInfo getPrimaryMonitor();
+    int getMonitorCount();
+    
+    // 螢幕變更追蹤（支援 3 螢幕以上熱插拔）
+    void initMonitorTracking();
+    void syncMonitorTracking();
+    int getPreviousMonitorCount();
     
     // 螢幕模式偵測
     bool isExtendedMode();
     bool isMirroredMode();
     bool isCoordinateValidInCurrentMode(int x, int y);
+    bool isPointInAnyMonitor(POINT pt);
+    bool isRectVisibleOnAnyMonitor(const RECT& rect, int minVisiblePercent = 50);
+    bool isWindowVisibleOnAnyMonitor(HWND hwnd, int minVisiblePercent = 50);
     
     // 螢幕變更處理
     void handleDisplayChange();

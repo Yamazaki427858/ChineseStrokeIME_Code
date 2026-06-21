@@ -94,6 +94,7 @@ void showTrayMenu(HWND hwnd, GlobalState& state) {
     
     AppendMenu(hMenu, MF_STRING, 2006, L"🔄 重新載入配置");
     AppendMenu(hMenu, MF_STRING, 2013, L"⬇️ 從GitHub更新字碼表");
+    AppendMenu(hMenu, MF_STRING, 2014, L"⬇️ 從GitHub更新Emoji");
 
     HMENU hStrokeCustomMenu = CreatePopupMenu();
     if (hStrokeCustomMenu) {

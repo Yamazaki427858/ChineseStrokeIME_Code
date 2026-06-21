@@ -35,6 +35,7 @@ namespace PositionManager {
     void savePositions(const GlobalState& state);
     
     // 螢幕模式相關位置調整
+    void initScreenModeTracking();
     void adjustPositionForScreenMode(GlobalState& state);
     void ensureVisiblePosition(GlobalState& state);
     

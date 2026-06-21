@@ -25,11 +25,34 @@ enum class InputMode {
 // 例如：3.1.0、Beta4.0.a、3.0.0-alpha、v2.0.0-beta.1 等均可
 // 版本比較：使用字符串比較，只要字符串不同即判定為不同版本
 //
-#define APP_VERSION "3.2.0"
+#define APP_VERSION "3.3.0"
 // ========== 【版本號定義結束】 ==========
 
 // 常數定義
 const int CANDIDATES_PER_PAGE = 9;
+
+// Emoji 選單（P 鍵）網格與 UI 尺寸
+const int EMOJI_GRID_COLS = 8;
+const int EMOJI_GRID_ROWS = 5;
+const int EMOJI_PER_PAGE = EMOJI_GRID_COLS * EMOJI_GRID_ROWS;
+const int EMOJI_CELL_SIZE = 36;
+const int EMOJI_MODE_BAR_H = 28;
+const int EMOJI_CATEGORY_BAR_H = 32;
+const int EMOJI_FOOTER_H = 28;
+const int EMOJI_CATEGORY_TAB_W = 36;
+const int EMOJI_SCROLL_BTN_W = 20;
+
+enum class PunctMenuMode { PUNCT, EMOJI };
+
+struct EmojiGroup {
+    std::wstring slug;
+    std::wstring label;
+    std::wstring icon;
+    std::wstring file;
+    int count = 0;
+    bool loaded = false;
+    std::vector<std::wstring> emojis;
+};
 const int FIXED_WIDTH = 380;
 const int CHARS_PER_LINE = 10;
 const int MIN_HEIGHT = 80;
@@ -158,6 +181,30 @@ struct GlobalState {
     bool isInputting = false;
     bool inputError = false;
     bool showPunctMenu = false;
+    PunctMenuMode punctMenuMode = PunctMenuMode::PUNCT;
+    HWND punctMenuTargetHwnd = NULL;  // 開啟標點/Emoji 選單前的前景輸入視窗
+    std::vector<EmojiGroup> emojiGroups;
+    int emojiGroupIndex = 0;
+    int emojiCategoryScroll = 0;
+    int emojiHoverCell = -1;
+    int emojiGridCols = EMOJI_GRID_COLS;
+    int emojiGridRows = EMOJI_GRID_ROWS;
+    std::wstring emojiDataVersion;
+
+    // Emoji 選單 UI hit-test 區域（drawEmojiPicker 更新）
+    RECT punctModeTabRect = {0};
+    RECT emojiModeTabRect = {0};
+    RECT emojiCloseButtonRect = {0};
+    RECT emojiCatPrevRect = {0};
+    RECT emojiCatNextRect = {0};
+    std::vector<RECT> emojiCategoryTabRects;
+    RECT emojiGridRect = {0};
+    bool punctModeTabHover = false;
+    bool emojiModeTabHover = false;
+    bool emojiCloseHover = false;
+    bool emojiCatPrevHover = false;
+    bool emojiCatNextHover = false;
+    int emojiHoverCategoryTab = -1;
 	
 	// 文字選取狀態
     bool isSelecting = false;           // 是否正在選取
@@ -261,6 +308,8 @@ struct GlobalState {
     bool showStrokeSymbols = true;
     // 螢幕模式變更時是否彈出提示（預設關閉，靜默處理）
     bool showScreenModeNotification = false;
+    // 啟動自動檢查發現新版本時不再彈窗（interfaceconfig.ini [WindowBehavior]，預設 false）
+    bool suppressVersionUpdateReminder = false;
     // 迷你「劃／E」工具列（僅兩鍵＋右鍵選單；interfaceconfig.ini [WindowBehavior]，預設關閉）
     bool toolbarClassicModeBadges = false;
     

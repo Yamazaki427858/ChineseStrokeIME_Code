@@ -5,11 +5,69 @@
 #include "window_manager.h"
 #include "ime_manager.h"
 #include <windows.h>
+#include <vector>
 
 extern GlobalState g_state;
 extern HHOOK g_hKeyboardHook;
 
 namespace InputHandler {
+
+static bool isImeOwnedWindow(HWND hwnd) {
+    if (!hwnd) return true;
+    return hwnd == g_state.hWnd || hwnd == g_state.hCandWnd ||
+           hwnd == g_state.hInputWnd || hwnd == g_state.hPredWnd ||
+           hwnd == g_state.hBufferWnd;
+}
+
+static void focusWindowHwnd(HWND target) {
+    if (!target || !IsWindow(target)) return;
+
+    DWORD currentThread = GetCurrentThreadId();
+    DWORD targetThread = GetWindowThreadProcessId(target, NULL);
+    bool attached = false;
+    if (currentThread != targetThread) {
+        AttachThreadInput(currentThread, targetThread, TRUE);
+        attached = true;
+    }
+
+    SetForegroundWindow(target);
+    SetActiveWindow(target);
+
+    if (attached) {
+        AttachThreadInput(currentThread, targetThread, FALSE);
+    }
+}
+
+static void capturePunctMenuTarget(GlobalState& state) {
+    HWND fg = GetForegroundWindow();
+    if (!isImeOwnedWindow(fg)) {
+        state.punctMenuTargetHwnd = fg;
+        return;
+    }
+    state.punctMenuTargetHwnd = NULL;
+}
+
+void refreshPunctMenuTargetIfNeeded() {
+    if (!g_state.showPunctMenu) return;
+    HWND fg = GetForegroundWindow();
+    if (!isImeOwnedWindow(fg)) {
+        g_state.punctMenuTargetHwnd = fg;
+    }
+}
+
+// 確保目標視窗有焦點
+void ensureTargetWindowFocused() {
+    refreshPunctMenuTargetIfNeeded();
+
+    HWND fg = GetForegroundWindow();
+    if (!isImeOwnedWindow(fg)) {
+        return;
+    }
+
+    if (g_state.showPunctMenu && g_state.punctMenuTargetHwnd && IsWindow(g_state.punctMenuTargetHwnd)) {
+        focusWindowHwnd(g_state.punctMenuTargetHwnd);
+    }
+}
 
 bool isStrokeLetterVK(const GlobalState& state, DWORD key) {
     if (!state.useCustomStrokeKeys) {
@@ -37,42 +95,30 @@ bool isNumpadStrokeVK(const GlobalState& state, DWORD key) {
     return key == nu || key == ni || key == no || key == nj || key == nk;
 }
 
-// 確保目標視窗有焦點
-void ensureTargetWindowFocused() {
-    HWND hForeground = GetForegroundWindow();
-    if (!hForeground || hForeground == g_state.hWnd || 
-        hForeground == g_state.hCandWnd || hForeground == g_state.hInputWnd ||
-        hForeground == g_state.hBufferWnd) {
-        return;
+static void sendUnicodeInputs(const std::wstring& text) {
+    if (text.empty()) return;
+    std::vector<INPUT> inputs;
+    inputs.reserve(text.size() * 2);
+    for (wchar_t ch : text) {
+        INPUT down = {};
+        down.type = INPUT_KEYBOARD;
+        down.ki.wScan = ch;
+        down.ki.dwFlags = KEYEVENTF_UNICODE;
+        inputs.push_back(down);
+
+        INPUT up = down;
+        up.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        inputs.push_back(up);
     }
-    
-    DWORD currentThread = GetCurrentThreadId();
-    DWORD targetThread = GetWindowThreadProcessId(hForeground, NULL);
-    bool attached = false;
-    
-    if (currentThread != targetThread) {
-        AttachThreadInput(currentThread, targetThread, TRUE);
-        attached = true;
-    }
-    
-    SetForegroundWindow(hForeground);
-    SetActiveWindow(hForeground);
-    
-    // 嘗試設置焦點到編輯控件
-    HWND hFocus = GetFocus();
-    if (!hFocus || hFocus == hForeground) {
-        SetFocus(hForeground);
-    }
-    
-    if (attached) {
-        AttachThreadInput(currentThread, targetThread, FALSE);
-    }
-    
-    Sleep(50);
+    SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
 }
 
 void sendTextDirectUnicode(const std::wstring& text) {
     if (text.empty()) return;
+
+    if (!g_state.bufferMode) {
+        ensureTargetWindowFocused();
+    }
     
     bool wasBufferFocused = g_state.bufferHasFocus;
     bool wasBufferVisible = g_state.bufferMode && g_state.hBufferWnd && IsWindowVisible(g_state.hBufferWnd);
@@ -84,30 +130,8 @@ void sendTextDirectUnicode(const std::wstring& text) {
         ShowWindow(g_state.hBufferWnd, SW_HIDE);
         Sleep(50);
     }
-    
-    
-    for (wchar_t ch : text) {
-        INPUT input = {0};
-        input.type = INPUT_KEYBOARD;
-        input.ki.wVk = 0;
-        input.ki.wScan = ch;
-        input.ki.dwFlags = KEYEVENTF_UNICODE;
-        input.ki.time = 0;
-        input.ki.dwExtraInfo = 0;
-        SendInput(1, &input, sizeof(INPUT));
-        
-        input.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
-        SendInput(1, &input, sizeof(INPUT));
-        
-        
-        INPUT flushInput = {0};
-        flushInput.type = INPUT_KEYBOARD;
-        flushInput.ki.wVk = VK_PACKET;
-        flushInput.ki.dwFlags = KEYEVENTF_KEYUP;
-        SendInput(1, &flushInput, sizeof(INPUT));
-        
-        Sleep(8);
-    }
+
+    sendUnicodeInputs(text);
     
     if (g_state.bufferMode && g_state.hBufferWnd && wasBufferVisible) {
         Sleep(100);
@@ -148,6 +172,7 @@ void setChineseInputMode(GlobalState& state, bool chinese) {
     state.isInputting = false;
     state.inputError = false;
     state.showPunctMenu = false;
+    state.punctMenuMode = PunctMenuMode::PUNCT;
     // 切換語言模式：完全中斷聯想前文
     state.lastSelected.clear();
     state.lastBigram.clear();
@@ -268,8 +293,74 @@ void processStroke(GlobalState& state, DWORD key) {
     }
 }
 
+void closePunctMenu(GlobalState& state) {
+    state.showPunctMenu = false;
+    state.punctMenuMode = PunctMenuMode::PUNCT;
+    state.punctMenuTargetHwnd = NULL;
+    state.emojiHoverCell = -1;
+    state.input.clear();
+    state.candidates.clear();
+    state.candidateCodes.clear();
+    state.showCand = false;
+    state.isInputting = false;
+    state.inputError = false;
+    WindowManager::switchMode(state, InputMode::IDLE);
+    IMEManager::restoreWindowsIME();
+    if (state.hCandWnd) ShowWindow(state.hCandWnd, SW_HIDE);
+    if (state.hPredWnd) ShowWindow(state.hPredWnd, SW_HIDE);
+    if (state.hInputWnd) ShowWindow(state.hInputWnd, SW_HIDE);
+    if (state.hWnd) InvalidateRect(state.hWnd, nullptr, FALSE);
+    if (state.hWnd) KillTimer(state.hWnd, 991);
+}
+
+void switchPunctMenuMode(GlobalState& state, PunctMenuMode mode) {
+    if (!state.showPunctMenu) return;
+    state.punctMenuMode = mode;
+    state.currentPage = 0;
+    state.selected = 0;
+    state.hoverCandidateIndex = -1;
+    state.emojiHoverCell = -1;
+    state.emojiCategoryScroll = 0;
+
+    if (mode == PunctMenuMode::EMOJI) {
+        if (state.emojiGroups.empty()) {
+            Dictionary::loadEmojiGroups(state);
+        }
+        if (state.emojiGroups.empty()) {
+            Utils::updateStatus(state, L"Emoji 資料未載入（請檢查網路，或從托盤選單手動更新）");
+            state.punctMenuMode = PunctMenuMode::PUNCT;
+            return;
+        }
+        Dictionary::applyEmojiGroupDisplay(state, state.emojiGroupIndex >= 0 ? state.emojiGroupIndex : 0);
+        Utils::updateStatus(state, L"Emoji 選單（滑鼠選取，ESC 關閉）");
+    } else {
+        state.candidates = state.punctCandidates;
+        state.candidateCodes.clear();
+        for (size_t i = 0; i < state.candidates.size(); i++) {
+            state.candidateCodes.push_back(L"P");
+        }
+        state.totalPages = (state.candidates.size() + CANDIDATES_PER_PAGE - 1) / CANDIDATES_PER_PAGE;
+        if (state.totalPages < 1) state.totalPages = 1;
+        Utils::updateStatus(state, L"全形標點符號選單（1-9 選字，ESC 關閉）");
+    }
+
+    WindowManager::positionWindowsOptimized(state);
+    if (state.hInputWnd) ShowWindow(state.hInputWnd, SW_HIDE);
+    if (state.hCandWnd) {
+        InvalidateRect(state.hCandWnd, nullptr, TRUE);
+        UpdateWindow(state.hCandWnd);
+    }
+}
+
 void showPunctMenu(GlobalState& state) {
+    capturePunctMenuTarget(state);
     state.showPunctMenu = true;
+    state.punctMenuMode = PunctMenuMode::PUNCT;
+    state.emojiCategoryScroll = 0;
+    state.emojiHoverCell = -1;
+    state.input.clear();
+    state.isInputting = false;
+    state.inputError = false;
     state.candidates = state.punctCandidates;
     state.candidateCodes.clear();
     for (size_t i = 0; i < state.candidates.size(); i++) {
@@ -278,16 +369,18 @@ void showPunctMenu(GlobalState& state) {
     state.selected = 0;
     state.currentPage = 0;
     state.totalPages = (state.candidates.size() + CANDIDATES_PER_PAGE - 1) / CANDIDATES_PER_PAGE;
+    if (state.totalPages < 1) state.totalPages = 1;
     state.showCand = true;
 
-    // 標點選單視為一般候選模式：顯示候選視窗、隱藏聯想視窗
     WindowManager::switchMode(state, InputMode::CAND_MODE);
+    if (state.hInputWnd) ShowWindow(state.hInputWnd, SW_HIDE);
+    if (state.hWnd) SetTimer(state.hWnd, 991, 250, NULL);
     WindowManager::positionWindowsOptimized(state);
     if (state.hCandWnd) {
         InvalidateRect(state.hCandWnd, nullptr, TRUE);
     }
     
-    Utils::updateStatus(state, L"全形標點符號選單（按ESC關閉）");
+    Utils::updateStatus(state, L"標點／Emoji 選單（ESC 關閉，可切換 Emoji 分頁）");
 }
 
 void processPunctuator(GlobalState& state, DWORD key) {
@@ -589,8 +682,10 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
             if (isBufferWindowActive) {
                 // 如果有候選字或標點符號選單打開，數字鍵（未按 Shift）用於選擇候選項；Shift+數字則強制輸入標點到暫放視窗
                 if ((g_state.showCand || g_state.showPunctMenu) && (key >= '1' && key <= '9') && !g_state.shiftPressed) {
-                    PostMessage(g_state.hWnd, WM_USER+100, key, 0);
-                    return 1;
+                    if (!(g_state.showPunctMenu && g_state.punctMenuMode == PunctMenuMode::EMOJI)) {
+                        PostMessage(g_state.hWnd, WM_USER+100, key, 0);
+                        return 1;
+                    }
                 }
                 
                 // 方向鍵控制（含主鍵盤上下左右、Home/End，以及 NumLock 關閉時小鍵盤 2/4/6/8）
@@ -934,14 +1029,31 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                        (key == '9' && g_state.shiftPressed) || (key == '0' && g_state.shiftPressed) ||
                        key == VK_MULTIPLY || key == VK_ADD || key == VK_SUBTRACT || key == VK_DECIMAL || key == VK_DIVIDE);
                 
-                bool isFunctionKey = ((g_state.isInputting || g_state.showPunctMenu) && 
-                          (key == VK_SPACE || key == VK_BACK || key == VK_ESCAPE ||
+                bool isFunctionKey = false;
+                if (g_state.showPunctMenu) {
+                    // 選單開啟時僅攔截選單專用鍵，其餘（Backspace、方向鍵、一般輸入）交給前景程式
+                    if (key == VK_ESCAPE || key == 'P') {
+                        isFunctionKey = true;
+                    } else if (g_state.punctMenuMode == PunctMenuMode::PUNCT &&
+                               key >= '1' && key <= '9') {
+                        isFunctionKey = true;
+                    }
+                } else if (g_state.isInputting || g_state.showCand) {
+                    isFunctionKey = (key == VK_SPACE || key == VK_BACK || key == VK_ESCAPE ||
                            key == VK_UP || key == VK_DOWN || key == VK_TAB ||
-                           (key >= '1' && key <= '9')));
+                           (key >= '1' && key <= '9'));
+                }
 
                 if (g_state.chineseMode) {
+                    if (g_state.showPunctMenu) {
+                        refreshPunctMenuTargetIfNeeded();
+                        if (isFunctionKey) {
+                            PostMessage(g_state.hWnd, WM_USER+100, key, 0);
+                            return 1;
+                        }
+                        return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
+                    }
                     // 中文模式：攔截筆劃鍵、標點符號和功能鍵
-                    // 注意：Windows IME 已在函數開頭統一禁用，這裡不需要重複調用
                     if (isStrokeKey || isPunctKey || (key == VK_SPACE && g_state.isInputting) || isFunctionKey) {
                         PostMessage(g_state.hWnd, WM_USER+100, key, 0);
                         return 1;

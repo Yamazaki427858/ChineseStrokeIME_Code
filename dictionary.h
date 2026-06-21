@@ -9,8 +9,14 @@ namespace Dictionary {
     void loadMainDict(GlobalState& state);
     void loadPunctuator(GlobalState& state);
     void loadPunctMenu(GlobalState& state);
+    void loadEmojiGroups(GlobalState& state);
+    bool loadEmojiGroupAt(GlobalState& state, int groupIndex);
+    void applyEmojiGroupDisplay(GlobalState& state, int groupIndex);
+    void selectEmoji(GlobalState& state, const std::wstring& emoji);
+    bool updateEmojiFromGitHub(GlobalState& state, bool showProgress = true);
     void loadUserDict(GlobalState& state);
     void saveUserDict(const GlobalState& state);
+    bool removeFromUserDict(GlobalState& state, const std::wstring& word);
     
     // 智能聯想引擎持久化
     void loadContextLearning(GlobalState& state);

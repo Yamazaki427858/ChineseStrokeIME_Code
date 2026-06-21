@@ -69,6 +69,153 @@ void switchMode(GlobalState& state, InputMode newMode) {
 }
 
 
+struct VersionUpdateDialogData {
+    std::wstring content;
+    int result = 0;
+};
+
+static LRESULT CALLBACK VersionUpdateDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    VersionUpdateDialogData* data =
+        reinterpret_cast<VersionUpdateDialogData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
+    switch (msg) {
+    case WM_CREATE: {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lp);
+        data = reinterpret_cast<VersionUpdateDialogData*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(data));
+
+        HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+
+        HWND hTitle = CreateWindowW(L"STATIC", L"發現新版本可用！",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            20, 16, 360, 22, hwnd, NULL, NULL, NULL);
+        SendMessageW(hTitle, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+
+        HWND hBody = CreateWindowW(L"STATIC", data->content.c_str(),
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            20, 42, 360, 100, hwnd, NULL, NULL, NULL);
+        SendMessageW(hBody, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+
+        const int btnY = 150;
+        const int btnH = 30;
+        HWND hDownload = CreateWindowW(L"BUTTON", L"前往下載",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+            20, btnY, 110, btnH, hwnd, reinterpret_cast<HMENU>(1001), NULL, NULL);
+        HWND hLater = CreateWindowW(L"BUTTON", L"稍後",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+            145, btnY, 90, btnH, hwnd, reinterpret_cast<HMENU>(1002), NULL, NULL);
+        HWND hNever = CreateWindowW(L"BUTTON", L"不再提醒",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+            250, btnY, 110, btnH, hwnd, reinterpret_cast<HMENU>(1003), NULL, NULL);
+        SendMessageW(hDownload, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        SendMessageW(hLater, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        SendMessageW(hNever, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        return 0;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case 1001:
+            if (data) data->result = 1;
+            DestroyWindow(hwnd);
+            return 0;
+        case 1002:
+            if (data) data->result = 2;
+            DestroyWindow(hwnd);
+            return 0;
+        case 1003:
+            if (data) data->result = 3;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        if (data) data->result = 0;
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// 自動檢查版本更新對話框：1=前往下載，2=稍後，3=不再提醒，0=取消或失敗
+static int showAutoVersionUpdateDialog(HWND hwndParent, const std::wstring& content) {
+    static bool classRegistered = false;
+    static const wchar_t* kDlgClass = L"CSIME_VersionUpdateDlg";
+
+    if (!classRegistered) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = VersionUpdateDlgProc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.lpszClassName = kDlgClass;
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        if (!RegisterClassExW(&wc)) {
+            return 0;
+        }
+        classRegistered = true;
+    }
+
+    VersionUpdateDialogData dialogData;
+    dialogData.content = content;
+
+    const int dlgW = 400;
+    const int dlgH = 220;
+    int dlgX = 0;
+    int dlgY = 0;
+    {
+        HMONITOR hMon = hwndParent
+            ? MonitorFromWindow(hwndParent, MONITOR_DEFAULTTONEAREST)
+            : MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        MONITORINFO mi = {};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(hMon, &mi)) {
+            const RECT& rc = mi.rcWork;
+            dlgX = rc.left + (rc.right - rc.left - dlgW) / 2;
+            dlgY = rc.top + (rc.bottom - rc.top - dlgH) / 2;
+        }
+    }
+
+    HWND dlg = CreateWindowExW(
+        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        kDlgClass, L"版本更新通知",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        dlgX, dlgY, dlgW, dlgH,
+        hwndParent, NULL, GetModuleHandleW(NULL), &dialogData);
+    if (!dlg) {
+        return 0;
+    }
+
+    if (hwndParent) {
+        EnableWindow(hwndParent, FALSE);
+    }
+    ShowWindow(dlg, SW_SHOW);
+    UpdateWindow(dlg);
+    SetForegroundWindow(dlg);
+
+    MSG msg;
+    while (IsWindow(dlg)) {
+        if (GetMessageW(&msg, NULL, 0, 0) <= 0) {
+            break;
+        }
+        if (msg.message == WM_QUIT) {
+            PostQuitMessage(static_cast<int>(msg.wParam));
+            break;
+        }
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    if (hwndParent) {
+        EnableWindow(hwndParent, TRUE);
+        SetForegroundWindow(hwndParent);
+    }
+
+    return dialogData.result;
+}
+
+
 // ========== 【日後修改關於對話框內容請修改此函數】 ==========
 // 此函數用於顯示「關於」對話框，所有入口（主菜單、托盤菜單、主窗口按鈕）都調用此函數
 // 
@@ -319,6 +466,486 @@ void drawCandidate(HWND hwnd, HDC hdc, const GlobalState& state) {
     // 字型使用快取，不 DeleteObject
 }
 
+static HFONT s_emojiFont = NULL;
+static int s_emojiFontSize = -1;
+
+static int emojiCellSize(const GlobalState& state) {
+    return std::max(28, state.candidateFontSize + 18);
+}
+static int emojiModeBarH(const GlobalState& state) {
+    return std::max(24, state.candidateFontSize + 10);
+}
+static int emojiCategoryBarH(const GlobalState& state) {
+    return std::max(28, state.candidateFontSize + 14);
+}
+static int emojiFooterH(const GlobalState& state) {
+    return std::max(24, state.candidateFontSize + 10);
+}
+static int emojiCategoryTabW(const GlobalState& state) {
+    return emojiCellSize(state);
+}
+static int emojiModeTabW(const GlobalState& state) {
+    return std::max(44, state.candidateFontSize * 3);
+}
+
+static HFONT getEmojiFont(int size) {
+    if (!s_emojiFont || s_emojiFontSize != size) {
+        if (s_emojiFont) DeleteObject(s_emojiFont);
+        s_emojiFont = CreateFontW(
+            size, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+            DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Emoji");
+        if (!s_emojiFont) {
+            s_emojiFont = CreateFontW(
+                size, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Symbol");
+        }
+        s_emojiFontSize = size;
+    }
+    return s_emojiFont;
+}
+
+static bool isWhiteFlagEmoji(const std::wstring& emoji) {
+    // 🏳 (U+1F3F3) 含可選 U+FE0F；GDI 常無法顯示，選單改以 ⚐ 代替
+    if (emoji.size() < 2 || emoji.size() > 3) return false;
+    if (emoji[0] != 0xD83C || emoji[1] != 0xDFF3) return false;
+    if (emoji.size() == 2) return true;
+    return emoji[2] == 0xFE0F;
+}
+
+static std::wstring emojiDisplayText(const std::wstring& emoji) {
+    if (isWhiteFlagEmoji(emoji)) return L"\x2690";
+    return emoji;
+}
+
+static void drawEmojiText(HDC hdc, const std::wstring& text, const RECT& rc, int fontSize, HFONT uiFont) {
+    if (text.empty()) return;
+    const std::wstring display = emojiDisplayText(text);
+    HFONT drawFont = getEmojiFont(fontSize);
+    HFONT tempFont = NULL;
+    if (display != text) {
+        LOGFONTW lf = {};
+        GetObjectW(uiFont, sizeof(LOGFONTW), &lf);
+        tempFont = CreateFontW(
+            fontSize + 8, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            lf.lfCharSet, lf.lfOutPrecision, lf.lfClipPrecision,
+            CLEARTYPE_QUALITY, lf.lfPitchAndFamily, lf.lfFaceName);
+        if (tempFont) drawFont = tempFont;
+        else drawFont = uiFont;
+    }
+    HFONT old = (HFONT)SelectObject(hdc, drawFont);
+    SetBkMode(hdc, TRANSPARENT);
+    DrawTextW(hdc, display.c_str(), -1, const_cast<RECT*>(&rc),
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(hdc, old);
+    if (tempFont) DeleteObject(tempFont);
+}
+
+static void fillButtonRect(HDC hdc, const RECT& rc, COLORREF bg, COLORREF border, bool hover) {
+    COLORREF fill = hover ? RGB(200, 200, 200) : bg;
+    HBRUSH br = CreateSolidBrush(fill);
+    FillRect(hdc, &rc, br);
+    DeleteObject(br);
+    HPEN pen = CreatePen(PS_SOLID, 1, border);
+    HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+    SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
+    SelectObject(hdc, oldPen);
+    DeleteObject(pen);
+}
+
+void drawEmojiPicker(HWND hwnd, HDC hdc, GlobalState& state) {
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+
+    HBRUSH hBg = CreateSolidBrush(state.candidateBackgroundColor);
+    FillRect(hdc, &rc, hBg);
+    DeleteObject(hBg);
+
+    HPEN hPen = CreatePen(PS_SOLID, 1, RGB(180, 180, 180));
+    HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+    SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    Rectangle(hdc, 0, 0, rc.right, rc.bottom);
+    SelectObject(hdc, hOldPen);
+    DeleteObject(hPen);
+
+    SetBkMode(hdc, TRANSPARENT);
+
+    if (!s_candFont || s_candFontSize != state.candidateFontSize || s_candFontName != state.candidateFontName) {
+        if (s_candFont) DeleteObject(s_candFont);
+        s_candFont = CreateFontW(
+            state.candidateFontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+            state.candidateFontName.c_str()
+        );
+        s_candFontSize = state.candidateFontSize;
+        s_candFontName = state.candidateFontName;
+    }
+    HFONT hOldFont = (HFONT)SelectObject(hdc, s_candFont);
+
+    const int modeBarH = emojiModeBarH(state);
+    const int catBarH = emojiCategoryBarH(state);
+    const int cellSize = emojiCellSize(state);
+    const int catTabW = emojiCategoryTabW(state);
+    const int modeTabW = emojiModeTabW(state);
+    const int closeBtnW = std::max(24, state.candidateFontSize + 10);
+
+    int y = 4;
+    const int pad = 8;
+    const int modeH = modeBarH - 4;
+
+    // 模式列：[標點] [Emoji] … [✕]
+    state.punctModeTabRect = { pad, y, pad + modeTabW, y + modeH };
+    state.emojiModeTabRect = { pad + modeTabW + 4, y, pad + modeTabW + 4 + modeTabW, y + modeH };
+    state.emojiCloseButtonRect = { rc.right - pad - closeBtnW, y, rc.right - pad, y + modeH };
+
+    fillButtonRect(hdc, state.punctModeTabRect, RGB(235, 235, 235), RGB(160, 160, 160),
+        state.punctModeTabHover);
+    fillButtonRect(hdc, state.emojiModeTabRect,
+        state.punctMenuMode == PunctMenuMode::EMOJI ? RGB(0, 120, 215) : RGB(235, 235, 235),
+        RGB(160, 160, 160), state.emojiModeTabHover);
+    fillButtonRect(hdc, state.emojiCloseButtonRect, RGB(235, 235, 235), RGB(160, 160, 160),
+        state.emojiCloseHover);
+
+    SetTextColor(hdc, state.punctMenuMode == PunctMenuMode::PUNCT ? RGB(255, 255, 255) : RGB(40, 40, 40));
+    if (state.punctMenuMode == PunctMenuMode::PUNCT) {
+        HBRUSH ab = CreateSolidBrush(RGB(0, 120, 215));
+        FillRect(hdc, &state.punctModeTabRect, ab);
+        DeleteObject(ab);
+        SetTextColor(hdc, RGB(255, 255, 255));
+    }
+    DrawTextW(hdc, L"標點", -1, &state.punctModeTabRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    SetTextColor(hdc, state.punctMenuMode == PunctMenuMode::EMOJI ? RGB(255, 255, 255) : RGB(40, 40, 40));
+    DrawTextW(hdc, L"Emoji", -1, &state.emojiModeTabRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SetTextColor(hdc, RGB(80, 80, 80));
+    DrawTextW(hdc, L"✕", -1, &state.emojiCloseButtonRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    y += modeBarH;
+
+    if (state.punctMenuMode == PunctMenuMode::PUNCT) {
+        int lineHeight = state.candidateFontSize + 6;
+        int startIndex = state.currentPage * CANDIDATES_PER_PAGE;
+        int endIndex = std::min(startIndex + CANDIDATES_PER_PAGE, (int)state.candidates.size());
+
+        SelectObject(hdc, s_candFont);
+
+        for (int i = 0; i < endIndex - startIndex; ++i) {
+            int actualIndex = startIndex + i;
+            if (actualIndex == state.hoverCandidateIndex) {
+                RECT bgRect = {8, y + 4 + i * lineHeight, rc.right - 8, y + 4 + (i + 1) * lineHeight};
+                COLORREF hoverBg = state.candidateHoverBackgroundColor ?
+                    state.candidateHoverBackgroundColor : state.candidateBackgroundColor;
+                HBRUSH hBrush = CreateSolidBrush(hoverBg);
+                FillRect(hdc, &bgRect, hBrush);
+                DeleteObject(hBrush);
+                SetTextColor(hdc, state.candidateHoverTextColor ?
+                    state.candidateHoverTextColor : state.candidateTextColor);
+            } else if (i == state.selected) {
+                RECT bgRect = {8, y + 4 + i * lineHeight, rc.right - 8, y + 4 + (i + 1) * lineHeight};
+                HBRUSH hBrush = CreateSolidBrush(state.selectedCandidateBackgroundColor);
+                FillRect(hdc, &bgRect, hBrush);
+                DeleteObject(hBrush);
+                SetTextColor(hdc, state.selectedCandidateTextColor);
+            } else {
+                SetTextColor(hdc, state.candidateTextColor);
+            }
+            std::wstring txt = std::to_wstring(i + 1) + L". " + state.candidates[actualIndex];
+            TextOutW(hdc, 15, y + 6 + i * lineHeight, txt.c_str(), (int)txt.size());
+        }
+
+        if (state.totalPages > 1) {
+            int controlY = y + 8 + CANDIDATES_PER_PAGE * lineHeight + 8;
+            int buttonSize = std::max(20, state.candidateFontSize + 2);
+            state.prevPageButtonRect = {10, controlY, 10 + buttonSize, controlY + buttonSize};
+            state.nextPageButtonRect = {15 + buttonSize, controlY, 15 + buttonSize * 2, controlY + buttonSize};
+            state.pageInfoRect = {20 + buttonSize * 2, controlY, rc.right - 10, controlY + buttonSize};
+
+            fillButtonRect(hdc, state.prevPageButtonRect,
+                state.currentPage > 0 ? RGB(220, 220, 220) : RGB(240, 240, 240),
+                RGB(160, 160, 160), state.prevPageButtonHover);
+            fillButtonRect(hdc, state.nextPageButtonRect,
+                state.currentPage < state.totalPages - 1 ? RGB(220, 220, 220) : RGB(240, 240, 240),
+                RGB(160, 160, 160), state.nextPageButtonHover);
+            SetTextColor(hdc, RGB(80, 80, 80));
+            DrawTextW(hdc, L"▲", -1, &state.prevPageButtonRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(hdc, L"▼", -1, &state.nextPageButtonRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            std::wstring pageInfo = std::to_wstring(state.currentPage + 1) + L"/" +
+                std::to_wstring(state.totalPages) + L" (共" +
+                std::to_wstring(state.candidates.size()) + L"個)";
+            DrawTextW(hdc, pageInfo.c_str(), -1, &state.pageInfoRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        }
+
+        SelectObject(hdc, hOldFont);
+        return;
+    }
+
+    // 分類列
+    state.emojiCatPrevRect = { pad, y + 4, pad + EMOJI_SCROLL_BTN_W, y + 4 + catBarH - 8 };
+    state.emojiCatNextRect = { rc.right - pad - EMOJI_SCROLL_BTN_W, y + 4,
+        rc.right - pad, y + 4 + catBarH - 8 };
+    fillButtonRect(hdc, state.emojiCatPrevRect, RGB(240, 240, 240), RGB(180, 180, 180), state.emojiCatPrevHover);
+    fillButtonRect(hdc, state.emojiCatNextRect, RGB(240, 240, 240), RGB(180, 180, 180), state.emojiCatNextHover);
+    DrawTextW(hdc, L"◀", -1, &state.emojiCatPrevRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    DrawTextW(hdc, L"▶", -1, &state.emojiCatNextRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    int catLeft = state.emojiCatPrevRect.right + 2;
+    int catRight = state.emojiCatNextRect.left - 2;
+    int maxVisible = std::max(1, (catRight - catLeft) / catTabW);
+    if (state.emojiCategoryScroll > (int)state.emojiGroups.size() - maxVisible) {
+        state.emojiCategoryScroll = std::max(0, (int)state.emojiGroups.size() - maxVisible);
+    }
+
+    state.emojiCategoryTabRects.clear();
+    for (int vi = 0; vi < maxVisible; ++vi) {
+        int gi = state.emojiCategoryScroll + vi;
+        if (gi >= (int)state.emojiGroups.size()) break;
+        RECT tab = { catLeft + vi * catTabW, y + 4,
+            catLeft + (vi + 1) * catTabW, y + 4 + catBarH - 8 };
+        state.emojiCategoryTabRects.push_back(tab);
+        bool active = (gi == state.emojiGroupIndex);
+        bool hover = (state.emojiHoverCategoryTab == gi);
+        fillButtonRect(hdc, tab, active ? RGB(200, 230, 255) : RGB(245, 245, 245),
+            RGB(180, 180, 180), hover && !active);
+        const std::wstring& icon = state.emojiGroups[gi].icon;
+        drawEmojiText(hdc, icon, tab, state.candidateFontSize, s_candFont);
+    }
+
+    y += catBarH;
+
+    // 網格
+    int gridW = state.emojiGridCols * cellSize;
+    int gridH = state.emojiGridRows * cellSize;
+    state.emojiGridRect = { pad, y, pad + gridW, y + gridH };
+
+    int perPage = state.emojiGridCols * state.emojiGridRows;
+    int startIndex = state.currentPage * perPage;
+    int total = (state.emojiGroupIndex >= 0 && state.emojiGroupIndex < (int)state.emojiGroups.size())
+        ? (int)state.emojiGroups[state.emojiGroupIndex].emojis.size() : (int)state.candidates.size();
+
+    for (int row = 0; row < state.emojiGridRows; ++row) {
+        for (int col = 0; col < state.emojiGridCols; ++col) {
+            int cell = row * state.emojiGridCols + col;
+            int idx = startIndex + cell;
+            RECT cellRc = {
+                state.emojiGridRect.left + col * cellSize,
+                state.emojiGridRect.top + row * cellSize,
+                state.emojiGridRect.left + (col + 1) * cellSize,
+                state.emojiGridRect.top + (row + 1) * cellSize
+            };
+            if (idx >= total) continue;
+            if (cell == state.emojiHoverCell) {
+                HBRUSH hb = CreateSolidBrush(state.candidateHoverBackgroundColor ?
+                    state.candidateHoverBackgroundColor : RGB(255, 169, 48));
+                FillRect(hdc, &cellRc, hb);
+                DeleteObject(hb);
+            }
+            std::wstring em;
+            if (state.emojiGroupIndex >= 0 && state.emojiGroupIndex < (int)state.emojiGroups.size()) {
+                const auto& list = state.emojiGroups[state.emojiGroupIndex].emojis;
+                if (idx < (int)list.size()) em = list[idx];
+            } else if (idx < (int)state.candidates.size()) {
+                em = state.candidates[idx];
+            }
+            if (!em.empty()) {
+                drawEmojiText(hdc, em, cellRc, state.candidateFontSize, s_candFont);
+            }
+        }
+    }
+
+    y = state.emojiGridRect.bottom + 4;
+
+    // 底部分頁（重用 prev/next page rects）
+    int footerBtn = std::max(20, state.candidateFontSize + 2);
+    state.prevPageButtonRect = { pad, y, pad + footerBtn, y + footerBtn };
+    state.nextPageButtonRect = { pad + footerBtn + 5, y, pad + footerBtn * 2 + 5, y + footerBtn };
+    state.pageInfoRect = { pad + footerBtn * 2 + 12, y, rc.right - pad, y + footerBtn };
+
+    if (state.totalPages > 1) {
+        fillButtonRect(hdc, state.prevPageButtonRect,
+            state.currentPage > 0 ? RGB(220, 220, 220) : RGB(240, 240, 240),
+            RGB(160, 160, 160), state.prevPageButtonHover);
+        fillButtonRect(hdc, state.nextPageButtonRect,
+            state.currentPage < state.totalPages - 1 ? RGB(220, 220, 220) : RGB(240, 240, 240),
+            RGB(160, 160, 160), state.nextPageButtonHover);
+        SetTextColor(hdc, RGB(80, 80, 80));
+        DrawTextW(hdc, L"▲", -1, &state.prevPageButtonRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextW(hdc, L"▼", -1, &state.nextPageButtonRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        std::wstring info = std::to_wstring(state.currentPage + 1) + L"/" +
+            std::to_wstring(state.totalPages);
+        if (state.emojiGroupIndex >= 0 && state.emojiGroupIndex < (int)state.emojiGroups.size()) {
+            info += L"  " + state.emojiGroups[state.emojiGroupIndex].label +
+                L" · 共" + std::to_wstring(total) + L"個";
+        }
+        DrawTextW(hdc, info.c_str(), -1, &state.pageInfoRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    } else {
+        SetTextColor(hdc, RGB(100, 100, 100));
+        std::wstring info = L"滑鼠點選插入 · ESC 關閉";
+        if (state.emojiGroupIndex >= 0 && state.emojiGroupIndex < (int)state.emojiGroups.size()) {
+            info = state.emojiGroups[state.emojiGroupIndex].label + L" · 共" +
+                std::to_wstring(total) + L"個 · ESC 關閉";
+        }
+        DrawTextW(hdc, info.c_str(), -1, &state.pageInfoRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    SelectObject(hdc, hOldFont);
+}
+
+static bool pointInRect(int x, int y, const RECT& r) {
+    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+}
+
+bool handleEmojiPickerClick(GlobalState& state, int x, int y) {
+    if (pointInRect(x, y, state.emojiCloseButtonRect)) {
+        InputHandler::closePunctMenu(state);
+        Utils::updateStatus(state, L"選單已關閉");
+        return true;
+    }
+    if (pointInRect(x, y, state.punctModeTabRect)) {
+        InputHandler::switchPunctMenuMode(state, PunctMenuMode::PUNCT);
+        return true;
+    }
+    if (pointInRect(x, y, state.emojiModeTabRect)) {
+        InputHandler::switchPunctMenuMode(state, PunctMenuMode::EMOJI);
+        return true;
+    }
+    if (state.punctMenuMode != PunctMenuMode::EMOJI) {
+        if (state.totalPages > 1) {
+            if (pointInRect(x, y, state.prevPageButtonRect) && state.currentPage > 0) {
+                Dictionary::changePage(state, -1);
+                return true;
+            }
+            if (pointInRect(x, y, state.nextPageButtonRect) && state.currentPage < state.totalPages - 1) {
+                Dictionary::changePage(state, 1);
+                return true;
+            }
+        }
+        return false;
+    }
+    if (pointInRect(x, y, state.emojiCatPrevRect) && state.emojiCategoryScroll > 0) {
+        state.emojiCategoryScroll--;
+        if (state.hCandWnd) InvalidateRect(state.hCandWnd, nullptr, TRUE);
+        return true;
+    }
+    if (pointInRect(x, y, state.emojiCatNextRect)) {
+        RECT rc;
+        GetClientRect(state.hCandWnd, &rc);
+        int catLeft = state.emojiCatPrevRect.right + 2;
+        int catRight = state.emojiCatNextRect.left - 2;
+        int maxVisible = std::max(1, (catRight - catLeft) / emojiCategoryTabW(state));
+        if (state.emojiCategoryScroll + maxVisible < (int)state.emojiGroups.size()) {
+            state.emojiCategoryScroll++;
+            if (state.hCandWnd) InvalidateRect(state.hCandWnd, nullptr, TRUE);
+        }
+        return true;
+    }
+    for (size_t vi = 0; vi < state.emojiCategoryTabRects.size(); ++vi) {
+        if (pointInRect(x, y, state.emojiCategoryTabRects[vi])) {
+            int gi = state.emojiCategoryScroll + (int)vi;
+            Dictionary::applyEmojiGroupDisplay(state, gi);
+            positionWindowsOptimized(state);
+            if (state.hCandWnd) InvalidateRect(state.hCandWnd, nullptr, TRUE);
+            return true;
+        }
+    }
+    if (state.totalPages > 1) {
+        if (pointInRect(x, y, state.prevPageButtonRect) && state.currentPage > 0) {
+            Dictionary::changePage(state, -1);
+            return true;
+        }
+        if (pointInRect(x, y, state.nextPageButtonRect) && state.currentPage < state.totalPages - 1) {
+            Dictionary::changePage(state, 1);
+            return true;
+        }
+    }
+    if (pointInRect(x, y, state.emojiGridRect)) {
+        int cellSz = emojiCellSize(state);
+        int col = (x - state.emojiGridRect.left) / cellSz;
+        int row = (y - state.emojiGridRect.top) / cellSz;
+        if (col >= 0 && col < state.emojiGridCols && row >= 0 && row < state.emojiGridRows) {
+            int cell = row * state.emojiGridCols + col;
+            int idx = state.currentPage * state.emojiGridCols * state.emojiGridRows + cell;
+            std::wstring em;
+            if (state.emojiGroupIndex >= 0 && state.emojiGroupIndex < (int)state.emojiGroups.size()) {
+                const auto& list = state.emojiGroups[state.emojiGroupIndex].emojis;
+                if (idx >= 0 && idx < (int)list.size()) em = list[idx];
+            }
+            if (!em.empty()) {
+                Dictionary::selectEmoji(state, em);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void updateEmojiPickerHover(GlobalState& state, int x, int y) {
+    bool need = false;
+    bool nPunct = pointInRect(x, y, state.punctModeTabRect);
+    bool nEmoji = pointInRect(x, y, state.emojiModeTabRect);
+    bool nClose = pointInRect(x, y, state.emojiCloseButtonRect);
+    bool nCatP = false;
+    bool nCatN = false;
+    if (state.punctMenuMode == PunctMenuMode::EMOJI) {
+        nCatP = pointInRect(x, y, state.emojiCatPrevRect);
+        nCatN = pointInRect(x, y, state.emojiCatNextRect);
+    }
+    if (nPunct != state.punctModeTabHover || nEmoji != state.emojiModeTabHover ||
+        nClose != state.emojiCloseHover || nCatP != state.emojiCatPrevHover ||
+        nCatN != state.emojiCatNextHover) {
+        state.punctModeTabHover = nPunct;
+        state.emojiModeTabHover = nEmoji;
+        state.emojiCloseHover = nClose;
+        state.emojiCatPrevHover = nCatP;
+        state.emojiCatNextHover = nCatN;
+        need = true;
+    }
+
+    int nHoverCat = -1;
+    if (state.punctMenuMode == PunctMenuMode::EMOJI) {
+        for (size_t vi = 0; vi < state.emojiCategoryTabRects.size(); ++vi) {
+            if (pointInRect(x, y, state.emojiCategoryTabRects[vi])) {
+                nHoverCat = state.emojiCategoryScroll + (int)vi;
+                break;
+            }
+        }
+    }
+    if (nHoverCat != state.emojiHoverCategoryTab) {
+        state.emojiHoverCategoryTab = nHoverCat;
+        need = true;
+    }
+
+    int nCell = -1;
+    if (state.punctMenuMode == PunctMenuMode::EMOJI && pointInRect(x, y, state.emojiGridRect)) {
+        int cellSz = emojiCellSize(state);
+        int col = (x - state.emojiGridRect.left) / cellSz;
+        int row = (y - state.emojiGridRect.top) / cellSz;
+        if (col >= 0 && col < state.emojiGridCols && row >= 0 && row < state.emojiGridRows) {
+            nCell = row * state.emojiGridCols + col;
+        }
+    }
+    if (nCell != state.emojiHoverCell) {
+        state.emojiHoverCell = nCell;
+        need = true;
+    }
+
+    if (state.totalPages > 1) {
+        bool nPrev = pointInRect(x, y, state.prevPageButtonRect) && state.currentPage > 0;
+        bool nNext = pointInRect(x, y, state.nextPageButtonRect) && state.currentPage < state.totalPages - 1;
+        if (nPrev != state.prevPageButtonHover || nNext != state.nextPageButtonHover) {
+            state.prevPageButtonHover = nPrev;
+            state.nextPageButtonHover = nNext;
+            need = true;
+        }
+    }
+
+    if (need && state.hCandWnd) {
+        scheduleDeferredInvalidate(DEFERRED_CAND);
+    }
+}
+
 // 聯想字視窗字型快取
 static HFONT s_predFont = NULL;
 static int s_predFontSize = -1;
@@ -492,9 +1119,11 @@ void positionPredictionWindow(GlobalState& state) {
     POINT basePos;
     RECT inputRect = {};
     bool hasInput = (state.hInputWnd != nullptr) && IsWindow(state.hInputWnd);
+    bool predOffScreen = state.hPredWnd && IsWindowVisible(state.hPredWnd) &&
+        !ScreenManager::isWindowVisibleOnAnyMonitor(state.hPredWnd, 50);
     
     // 跟隨滑鼠模式（g_useUserPosition == false）：與候選窗一致，用滑鼠位置，讓「⿻」恢復有效
-    if (!PositionManager::g_useUserPosition) {
+    if (!PositionManager::g_useUserPosition || predOffScreen) {
         basePos = PositionManager::getCurrentMousePosition();
     }
     // 使用者固定位置模式：以輸入窗為錨點，聯想窗緊貼不分離
@@ -564,8 +1193,22 @@ void positionCandidateWindow(GlobalState& state) {
     
     POINT basePos;
     
+    // 標點/Emoji 選單：已顯示時保留現有位置，僅調整大小（避免點按鈕時跟隨滑鼠跳動）
+    // 但若視窗已不在任何螢幕上（例如熱插拔後），改以滑鼠/安全位置重新定位
+    if (state.showPunctMenu && state.hCandWnd && IsWindowVisible(state.hCandWnd)) {
+        RECT cur = {};
+        GetWindowRect(state.hCandWnd, &cur);
+        if (cur.right > cur.left && cur.bottom > cur.top &&
+            ScreenManager::isRectVisibleOnAnyMonitor(cur, 50)) {
+            basePos.x = cur.left;
+            basePos.y = cur.top;
+            goto place_cand_window;
+        }
+    }
+
     // 如果用戶設定了固定位置，使用用戶位置；否則跟隨滑鼠（以滑鼠為錨點放置 hCandWnd）
-    if (PositionManager::g_useUserPosition && PositionManager::g_userCandPos.isValid) {
+    if (PositionManager::g_useUserPosition && PositionManager::g_userCandPos.isValid &&
+        ScreenManager::isPointInAnyMonitor({PositionManager::g_userCandPos.x, PositionManager::g_userCandPos.y})) {
         basePos.x = PositionManager::g_userCandPos.x;
         basePos.y = PositionManager::g_userCandPos.y;
     } else {
@@ -574,7 +1217,8 @@ void positionCandidateWindow(GlobalState& state) {
         ScreenManager::MonitorInfo currentMonitor = ScreenManager::getMonitorFromPoint(basePos);
         RECT workArea = currentMonitor.workArea;
         const int margin = 5;
-        int totalHeight = candHeight + INPUT_WINDOW_HEIGHT + 5;
+        int inputReserve = state.showPunctMenu ? 0 : (INPUT_WINDOW_HEIGHT + 5);
+        int totalHeight = candHeight + inputReserve;
         
         if (basePos.x + candWidth > workArea.right - margin)
             basePos.x = workArea.right - candWidth - margin;
@@ -583,14 +1227,28 @@ void positionCandidateWindow(GlobalState& state) {
         if (basePos.y + totalHeight > workArea.bottom - margin) {
             int newY = basePos.y - totalHeight - PositionManager::g_verticalOffset;
             if (newY >= workArea.top + margin)
-                basePos.y = newY + INPUT_WINDOW_HEIGHT + 5;
+                basePos.y = newY + inputReserve;
             else
-                basePos.y = workArea.top + margin + INPUT_WINDOW_HEIGHT + 5;
+                basePos.y = workArea.top + margin + inputReserve;
         }
-        if (basePos.y < workArea.top + INPUT_WINDOW_HEIGHT + margin)
-            basePos.y = workArea.top + INPUT_WINDOW_HEIGHT + margin;
+        if (basePos.y < workArea.top + inputReserve + margin)
+            basePos.y = workArea.top + inputReserve + margin;
     }
     
+place_cand_window:
+    {
+        ScreenManager::MonitorInfo currentMonitor = ScreenManager::getMonitorFromPoint(basePos);
+        RECT workArea = currentMonitor.workArea;
+        const int margin = 5;
+        if (basePos.x + candWidth > workArea.right - margin)
+            basePos.x = workArea.right - candWidth - margin;
+        if (basePos.x < workArea.left + margin)
+            basePos.x = workArea.left + margin;
+        if (basePos.y + candHeight > workArea.bottom - margin)
+            basePos.y = workArea.bottom - candHeight - margin;
+        if (basePos.y < workArea.top + margin)
+            basePos.y = workArea.top + margin;
+    }
     // 定位候選字視窗
     if (state.hCandWnd && state.showCand && candHeight > 0) {
         if (!state.menuShowing) {
@@ -608,13 +1266,20 @@ void positionCandidateWindow(GlobalState& state) {
         UpdateWindow(state.hCandWnd);
         
         RECT knownListRect = { basePos.x, basePos.y, basePos.x + candWidth, basePos.y + candHeight };
-        positionInputWindow(state, &knownListRect);
+        if (state.showPunctMenu) {
+            if (state.hInputWnd) ShowWindow(state.hInputWnd, SW_HIDE);
+        } else {
+            positionInputWindow(state, &knownListRect);
+        }
     } else {
         positionInputWindow(state);
     }
 }
 
 int calculateOptimalWindowWidth(const GlobalState& state) {
+    if (state.showPunctMenu && state.punctMenuMode == PunctMenuMode::EMOJI) {
+        return state.emojiGridCols * emojiCellSize(state) + 16;
+    }
     // 如果配置檔案有設定，優先使用配置檔案的寬度（固定寬度）
     int configWidth = state.candidateWidth;
     if (configWidth >= 200 && configWidth <= 1000) {
@@ -653,6 +1318,19 @@ int calculateOptimalWindowWidth(const GlobalState& state) {
 }
 
 int calculateCandidateWindowHeight(const GlobalState& state) {
+    if (state.showPunctMenu && state.punctMenuMode == PunctMenuMode::EMOJI) {
+        if (!state.showCand) return 0;
+        return emojiModeBarH(state) + emojiCategoryBarH(state) +
+            state.emojiGridRows * emojiCellSize(state) + emojiFooterH(state) + 16;
+    }
+    if (state.showPunctMenu && state.punctMenuMode == PunctMenuMode::PUNCT) {
+        if (!state.showCand || state.candidates.empty()) return emojiModeBarH(state) + 16;
+        int lineHeight = state.candidateFontSize + 8;
+        int contentLines = std::min(CANDIDATES_PER_PAGE, (int)state.candidates.size());
+        int h = emojiModeBarH(state) + 16 + contentLines * lineHeight;
+        if (state.totalPages > 1) h += 50;
+        return h;
+    }
     if (!state.showCand || state.candidates.empty()) return 0;
     
     int lineHeight = state.candidateFontSize + 8;
@@ -689,6 +1367,28 @@ void positionWindowsOptimized(GlobalState& state) {
     }
 }
 
+void repositionImeWindowsForDisplayChange(GlobalState& state) {
+    ScreenManager::updateMonitorInfo();
+    positionMainWindow(state);
+    positionWindowsOptimized(state);
+    if (state.bufferMode) {
+        updateBufferWindowPosition(state);
+    }
+    if (state.hCandWnd && IsWindowVisible(state.hCandWnd) &&
+        !ScreenManager::isWindowVisibleOnAnyMonitor(state.hCandWnd, 50)) {
+        positionWindowsOptimized(state);
+    }
+    if (state.hPredWnd && IsWindowVisible(state.hPredWnd) &&
+        !ScreenManager::isWindowVisibleOnAnyMonitor(state.hPredWnd, 50)) {
+        positionPredictionWindow(state);
+        positionInputWindow(state);
+    }
+    if (state.hInputWnd && IsWindowVisible(state.hInputWnd) &&
+        !ScreenManager::isWindowVisibleOnAnyMonitor(state.hInputWnd, 50)) {
+        positionWindowsOptimized(state);
+    }
+}
+
 void positionMainWindow(GlobalState& state) {
     // OptimizedUI 主視窗實際為工具列 290x35，勿用 config 的 580x70 以免被放大、右側空白且易被工作列遮蓋
     int w = state.windowWidth;
@@ -697,12 +1397,27 @@ void positionMainWindow(GlobalState& state) {
         w = state.toolbarClassicModeBadges ? MINI_TOOLBAR_WIDTH : TOOLBAR_WIDTH;
         h = state.toolbarClassicModeBadges ? MINI_TOOLBAR_HEIGHT : TOOLBAR_HEIGHT;
     }
-    
-    // 以「目前工具列位置所在螢幕」的工作區做邊界，避免接上副螢幕時被當成越界而推到主螢幕邊緣
-    POINT toolbarPt = { PositionManager::g_toolbarPos.x, PositionManager::g_toolbarPos.y };
-    RECT workArea = ScreenManager::getMonitorFromPoint(toolbarPt).workArea;
+
     int x = PositionManager::g_toolbarPos.x;
     int y = PositionManager::g_toolbarPos.y;
+    if (state.hWnd) {
+        RECT wr;
+        if (GetWindowRect(state.hWnd, &wr)) {
+            x = wr.left;
+            y = wr.top;
+        }
+    }
+
+    RECT toolbarRect = { x, y, x + w, y + h };
+    if (!ScreenManager::isRectVisibleOnAnyMonitor(toolbarRect, 50)) {
+        PositionManager::ensureVisiblePosition(state);
+        x = PositionManager::g_toolbarPos.x;
+        y = PositionManager::g_toolbarPos.y;
+    }
+
+    // 以「目前工具列位置所在螢幕」的工作區做邊界，避免接上副螢幕時被當成越界而推到主螢幕邊緣
+    POINT toolbarPt = { x, y };
+    RECT workArea = ScreenManager::getMonitorFromPoint(toolbarPt).workArea;
     const int margin = 5;
     
     if (x + w > workArea.right - margin)
@@ -831,9 +1546,27 @@ LRESULT handleKeyboardInput(HWND hwnd, WPARAM wp) {
     }
     
     // 功能鍵處理
+    if (g_state.showPunctMenu) {
+        if (key == VK_ESCAPE) {
+            InputHandler::closePunctMenu(g_state);
+            Utils::updateStatus(g_state, L"選單已關閉");
+            InvalidateRect(hwnd, nullptr, TRUE);
+            return 0;
+        }
+        if (g_state.punctMenuMode == PunctMenuMode::PUNCT && key >= '1' && key <= '9') {
+            Dictionary::selectCandidate(g_state, key - '1');
+            return 0;
+        }
+        return 0;
+    }
     if (key == VK_DOWN) { Dictionary::changePage(g_state, 1); return 0; }
     if (key == VK_UP) { Dictionary::changePage(g_state, -1); return 0; }
-    if (key >= '1' && key <= '9') { Dictionary::selectCandidate(g_state, key - '1'); return 0; }
+    if (key >= '1' && key <= '9') {
+        if (!(g_state.showPunctMenu && g_state.punctMenuMode == PunctMenuMode::EMOJI)) {
+            Dictionary::selectCandidate(g_state, key - '1');
+        }
+        return 0;
+    }
     if (key == VK_BACK) {
         if (!g_state.input.empty()) {
             // 有筆劃緩衝：只刪最後一個筆劃，不觸及前景文字
@@ -876,9 +1609,21 @@ LRESULT handleKeyboardInput(HWND hwnd, WPARAM wp) {
         }
         return 0;
     }
-    if (key == VK_SPACE) { Dictionary::selectCandidate(g_state, 0); return 0; }
+    if (key == VK_SPACE) {
+        if (g_state.showPunctMenu && g_state.punctMenuMode == PunctMenuMode::EMOJI) {
+            return 0;
+        }
+        Dictionary::selectCandidate(g_state, 0);
+        return 0;
+    }
     if (key == VK_RETURN) { InputHandler::handleEnterKeySmartly(g_state); return 0; }
     if (key == VK_ESCAPE) {
+        if (g_state.showPunctMenu) {
+            InputHandler::closePunctMenu(g_state);
+            Utils::updateStatus(g_state, L"選單已關閉");
+            InvalidateRect(hwnd, nullptr, TRUE);
+            return 0;
+        }
         g_state.input.clear();
         g_state.candidates.clear();
         g_state.candidateCodes.clear();
@@ -910,6 +1655,30 @@ LRESULT handleTrayMessage(HWND hwnd, LPARAM lp) {
 }
 
 // 處理命令消息 (WM_COMMAND)
+static void handleUpdateEmojiFromGitHubMenu(HWND hwnd) {
+    std::wstring manifestPath = g_state.userDir + L"emoji\\manifest.json";
+    std::ifstream checkFile(Utils::wstrToUtf8(manifestPath));
+    bool fileExists = checkFile.good();
+    checkFile.close();
+
+    if (fileExists) {
+        std::wstring confirmMsg = L"確定要從 GitHub 下載 Emoji 資料嗎？\n\n";
+        confirmMsg += L"注意：下載會覆蓋 user\\emoji\\ 目錄內的 JSON 檔案\n\n";
+        confirmMsg += L"點擊「是」開始下載更新，點擊「否」取消操作";
+
+        int result = MessageBoxW(hwnd, confirmMsg.c_str(),
+            L"確認下載 Emoji", MB_YESNO | MB_ICONWARNING);
+
+        if (result == IDYES) {
+            Dictionary::updateEmojiFromGitHub(g_state, true);
+        } else {
+            Utils::updateStatus(g_state, L"已取消下載 Emoji");
+        }
+    } else {
+        Dictionary::updateEmojiFromGitHub(g_state, true);
+    }
+}
+
 LRESULT handleCommand(HWND hwnd, WPARAM wp) {
     switch (LOWORD(wp)) {
         case 1001: InputHandler::showPunctMenu(g_state); break;
@@ -955,6 +1724,9 @@ LRESULT handleCommand(HWND hwnd, WPARAM wp) {
             }
             break;
         }
+        case 1021: // 從GitHub更新Emoji（工具列選單）
+            handleUpdateEmojiFromGitHubMenu(hwnd);
+            break;
         case 1007: {
             // 切換半透明顯示
             // 先從配置文件讀取最新的transparency_alpha值（用戶可能手動修改了配置文件）
@@ -1017,16 +1789,16 @@ LRESULT handleCommand(HWND hwnd, WPARAM wp) {
                 PostMessage(hwnd, WM_CLOSE, 0, 0);
             }
             break;
-        case 1101: // 候選右鍵：切換 pinned
-        case 1102: // 候選右鍵：切換 locked
-        case 1103: // 候選右鍵：刪除此聯想（可再次學回）
-        case 1104: { // 候選右鍵：永不再顯示 / 取消封鎖
+        case 1101: // 聯想字視窗右鍵：切換 pinned
+        case 1102: // 聯想字視窗右鍵：切換 locked
+        case 1103: // 聯想字視窗右鍵：刪除此聯想（可再次學回）
+        case 1104: { // 聯想字視窗右鍵：永不再顯示 / 取消封鎖
+            if (g_state.currentMode != InputMode::PRED_MODE) break;
             int idx = g_state.contextMenuCandIndex;
             if (idx < 0 || idx >= (int)g_state.candidates.size()) break;
-            // 使用 predictionQueryWord（聯想視窗的查詢前文）作為 prev key，
-            // 而非 lastSelected（選字後 lastSelected 已更新為剛選的字，不再是前文）
-            std::wstring prev = g_state.predictionQueryWord;
-            if (prev.empty()) prev = g_state.lastSelected;  // 兜底
+            // 與 PredProc 右鍵選單一致：優先 predictionQueryWord，兜底 lastSelected
+            std::wstring prev = g_state.predictionQueryWord.empty()
+                ? g_state.lastSelected : g_state.predictionQueryWord;
             if (prev.empty()) break;
             std::wstring next = g_state.candidates[idx];
             std::pair<std::wstring, std::wstring> key(prev, next);
@@ -1074,6 +1846,16 @@ LRESULT handleCommand(HWND hwnd, WPARAM wp) {
             // 儲存並重新顯示該字的聯想
             Dictionary::saveContextLearning(g_state);
             Dictionary::showPredictionsAfterSelection(g_state, prev);
+            break;
+        }
+        case 1105: { // 候選字視窗右鍵：從 user_dict 刪除此候選字（僅 CAND_MODE）
+            if (g_state.currentMode != InputMode::CAND_MODE) break;
+            int idx = g_state.contextMenuCandIndex;
+            if (idx < 0 || idx >= (int)g_state.candidates.size()) break;
+            std::wstring word = g_state.candidates[idx];
+            if (Dictionary::removeFromUserDict(g_state, word)) {
+                Dictionary::updateCandidates(g_state);
+            }
             break;
         }
         case 1009: {
@@ -1199,6 +1981,9 @@ LRESULT handleCommand(HWND hwnd, WPARAM wp) {
             }
             break;
         }
+        case 2014: // 從GitHub更新Emoji（托盤選單）
+            handleUpdateEmojiFromGitHubMenu(hwnd);
+            break;
         case 2009: // 重啟輸入法
             if (MessageBoxW(hwnd, L"確定要重啟輸入法嗎？\n\n重啟後將保留所有設定和學習記錄。", 
                 L"確認重啟", MB_YESNO | MB_ICONQUESTION) == IDYES) {
@@ -1300,7 +2085,11 @@ LRESULT CALLBACK CandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             HDC memDC = CreateCompatibleDC(hdc);
             HBITMAP memBitmap = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
             HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
-            drawCandidate(hwnd, memDC, g_state); 
+            if (g_state.showPunctMenu) {
+                drawEmojiPicker(hwnd, memDC, g_state);
+            } else {
+                drawCandidate(hwnd, memDC, g_state);
+            }
             BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
             SelectObject(memDC, oldBitmap);
             DeleteObject(memBitmap);
@@ -1312,21 +2101,34 @@ LRESULT CALLBACK CandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONDOWN: { 
             int x = LOWORD(lp);
             int y = HIWORD(lp);
-            
-            // ★ 只處理翻頁按鈕點擊（移除候選字點擊功能）
-            if (g_state.totalPages > 1) {
+
+            if (g_state.showPunctMenu) {
+                if (handleEmojiPickerClick(g_state, x, y)) {
+                    return 0;
+                }
+                if (g_state.punctMenuMode == PunctMenuMode::PUNCT && g_state.totalPages > 1) {
+                    if (isPointInPrevPageButton(x, y, g_state) && g_state.currentPage > 0) {
+                        Dictionary::changePage(g_state, -1);
+                        return 0;
+                    }
+                    if (isPointInNextPageButton(x, y, g_state) && g_state.currentPage < g_state.totalPages - 1) {
+                        Dictionary::changePage(g_state, 1);
+                        return 0;
+                    }
+                }
+            } else if (g_state.totalPages > 1) {
+                // 標點／候選模式：翻頁按鈕
                 if (isPointInPrevPageButton(x, y, g_state) && g_state.currentPage > 0) {
                     Dictionary::changePage(g_state, -1);
                     return 0;
                 }
-                
                 if (isPointInNextPageButton(x, y, g_state) && g_state.currentPage < g_state.totalPages - 1) {
                     Dictionary::changePage(g_state, 1);
                     return 0;
                 }
             }
             
-            // OptimizedUI 模式：從候選字視窗拖曳整塊（錨點為候選視窗上的點擊處）
+            // OptimizedUI 模式：從候選字視窗拖曳整塊（含標點/Emoji 選單）
             if (g_state.useOptimizedUI) {
                 g_state.dragState.isCandDragging = true;
                 SetCapture(hwnd);
@@ -1339,9 +2141,26 @@ LRESULT CALLBACK CandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0; 
         }
+
+        case WM_MOUSEWHEEL: {
+            if (g_state.showPunctMenu) {
+                short delta = GET_WHEEL_DELTA_WPARAM(wp);
+                if (delta > 0 && g_state.currentPage > 0) {
+                    Dictionary::changePage(g_state, -1);
+                } else if (delta < 0 && g_state.currentPage < g_state.totalPages - 1) {
+                    Dictionary::changePage(g_state, 1);
+                }
+                return 0;
+            }
+            break;
+        }
         
         case WM_RBUTTONDOWN: {
-            // 在候選列表上顯示 pinned / locked / del / block 右鍵選單
+            if (g_state.showPunctMenu) {
+                return 0;
+            }
+            // 候選字視窗（字碼模式）右鍵：僅 user_dict 管理，不含聯想設定
+            if (g_state.currentMode != InputMode::CAND_MODE) return 0;
             if (!g_state.showCand || g_state.candidates.empty()) return 0;
             
             int x = LOWORD(lp);
@@ -1365,31 +2184,14 @@ LRESULT CALLBACK CandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             
             g_state.contextMenuCandIndex = actualIndex;
             
-            HMENU hMenu = CreatePopupMenu();
+            std::wstring word = g_state.candidates[actualIndex];
+            bool inUserDict = g_state.wordFreq.find(word) != g_state.wordFreq.end();
             
-            // 依當前狀態動態決定 pinned / locked / block 文案
-            // 使用 predictionQueryWord（查詢前文）而非 lastSelected（已更新到剛選的字）
-            std::wstring prev = g_state.predictionQueryWord.empty()
-                ? g_state.lastSelected : g_state.predictionQueryWord;
-            std::wstring next = g_state.candidates[actualIndex];
-            std::pair<std::wstring, std::wstring> key(prev, next);
-            bool isPinned = g_state.pinnedContext.find(key) != g_state.pinnedContext.end();
-            bool isLocked = g_state.lockedContext.find(key) != g_state.lockedContext.end();
-            bool isBlocked = g_state.blockedContext.find(key) != g_state.blockedContext.end();
-
-            // 在選單上方顯示目前設定的聯想對象提示：「設定聯想：prev → next」
-            std::wstring headerText = L"設定聯想：" + prev + L" → " + next;
+            HMENU hMenu = CreatePopupMenu();
+            std::wstring headerText = L"用戶字典：" + word;
             AppendMenuW(hMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, headerText.c_str());
             AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
-            
-            AppendMenuW(hMenu, MF_STRING, 1101,
-                isPinned ? L"取消置頂 (unpin)" : L"⚐ 設為置頂 (pinned)");
-            AppendMenuW(hMenu, MF_STRING, 1102,
-                isLocked ? L"取消鎖定 (unlock)" : L"⚑ 設為鎖定 (locked)");
-            AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
-            AppendMenuW(hMenu, MF_STRING, 1103, L"刪除此聯想（可再次學回）");
-            AppendMenuW(hMenu, MF_STRING, 1104,
-                isBlocked ? L"取消永不再顯示" : L"永不再顯示此聯想");
+            AppendMenuW(hMenu, MF_STRING | (inUserDict ? 0 : MF_GRAYED), 1105, L"刪除此候選字");
             
             POINT pt = { x, y };
             ClientToScreen(hwnd, &pt);
@@ -1421,7 +2223,7 @@ LRESULT CALLBACK CandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // 發送空消息穩定焦點狀態
             PostMessage(hwnd, WM_NULL, 0, 0);
             
-            if (cmd >= 1101 && cmd <= 1104 && g_state.hWnd) {
+            if (cmd == 1105 && g_state.hWnd) {
                 PostMessageW(g_state.hWnd, WM_COMMAND, cmd, 0);
             }
             return 0;
@@ -1457,7 +2259,7 @@ LRESULT CALLBACK CandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
                 }
                 
-                if (g_state.hInputWnd) {
+                if (g_state.hInputWnd && !g_state.showPunctMenu) {
                     int inputY = newCandY - INPUT_WINDOW_HEIGHT - WINDOW_SPACING;
                     RECT inputRect;
                     GetWindowRect(g_state.hInputWnd, &inputRect);
@@ -1489,6 +2291,12 @@ LRESULT CALLBACK CandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             
             int x = LOWORD(lp);
             int y = HIWORD(lp);
+
+            if (g_state.showPunctMenu) {
+                updateEmojiPickerHover(g_state, x, y);
+                return 0;
+            }
+
             bool ctrlPressed = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             bool needRedraw = false;
             
@@ -1547,12 +2355,16 @@ LRESULT CALLBACK CandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_state.dragState.isCandDragging = false;
                 ReleaseCapture();
                 
-                // 記錄使用者自定義位置（基於字碼輸入視窗位置）
-                if (g_state.hInputWnd) {
-                    RECT inputRect;
-                    GetWindowRect(g_state.hInputWnd, &inputRect);
-                    PositionManager::g_userCandPos.x = inputRect.left;
-                    PositionManager::g_userCandPos.y = inputRect.top;
+                // 記錄使用者自定義位置
+                HWND posWnd = g_state.hCandWnd;
+                if (!g_state.showPunctMenu && g_state.hInputWnd && IsWindowVisible(g_state.hInputWnd)) {
+                    posWnd = g_state.hInputWnd;
+                }
+                if (posWnd) {
+                    RECT posRect;
+                    GetWindowRect(posWnd, &posRect);
+                    PositionManager::g_userCandPos.x = posRect.left;
+                    PositionManager::g_userCandPos.y = posRect.top;
                     PositionManager::g_userCandPos.isValid = true;
                     PositionManager::g_useUserPosition = true;
                     PositionManager::savePositions(g_state);
@@ -1628,9 +2440,10 @@ LRESULT CALLBACK PredProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         
         case WM_RBUTTONDOWN: {
-            // 聯想字視窗右鍵選單：只在有候選且有 lastSelected 時才有意義
+            // 聯想字視窗右鍵選單：僅在聯想模式提供聯想設定
+            if (g_state.currentMode != InputMode::PRED_MODE) return 0;
             if (!g_state.showCand || g_state.candidates.empty()) return 0;
-            if (g_state.lastSelected.empty()) return 0;
+            if (g_state.predictionQueryWord.empty() && g_state.lastSelected.empty()) return 0;
             
             int x = LOWORD(lp);
             int y = HIWORD(lp);
@@ -3060,6 +3873,7 @@ static void trackMainToolbarPopupMenu(HWND hwnd) {
     AppendMenu(hMenu, MF_STRING, 1001, L"標點符號選單");
     AppendMenu(hMenu, MF_STRING, 1002, L"重新載入字碼表");
     AppendMenu(hMenu, MF_STRING, 1008, L"從GitHub更新字碼表");
+    AppendMenu(hMenu, MF_STRING, 1021, L"從GitHub更新Emoji");
     AppendMenu(hMenu, MF_STRING, 1005, L"重新載入配置");
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
     std::wstring transparencyText = g_state.enableTransparency ? L"✓ 半透明顯示" : L"半透明顯示";
@@ -3231,16 +4045,17 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 				Dictionary::saveContextLearning(g_state);  // 儲存智能聯想引擎的個人上下文學習記錄
 				return 0;
 			}
+			if (wp == 991) {
+				InputHandler::refreshPunctMenuTargetIfNeeded();
+				return 0;
+			}
 			if (wp == 997) {
 				// 新增：延遲處理螢幕模式變更
 				KillTimer(hwnd, 997);
         
 				ScreenManager::handleDisplayChange();
 				PositionManager::adjustPositionForScreenMode(g_state);
-				// 重新定位所有輸入法視窗至工作區內（避免被工作列遮蓋）
-				ScreenManager::updateMonitorInfo();
-				WindowManager::positionMainWindow(g_state);
-				WindowManager::positionWindowsOptimized(g_state);
+				WindowManager::repositionImeWindowsForDisplayChange(g_state);
         
 				// 確保視窗可見
 				if (!IsWindowVisible(hwnd)) {
@@ -3275,6 +4090,10 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 			else if (wp == 994) {
 				// 啟動時自動檢查版本更新（僅在程序啟動時執行一次）
 				KillTimer(hwnd, 994);
+
+				if (g_state.suppressVersionUpdateReminder) {
+					return 0;
+				}
 				
 				// 檢查版本（使用緩存，但如果緩存過期會自動從 GitHub 獲取）
 				std::string currentVersion = APP_VERSION;
@@ -3286,17 +4105,19 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 					std::wstring currentVersionW = Utils::utf8ToWstr(currentVersion);
 					std::wstring remoteVersionW = Utils::utf8ToWstr(remoteVersion);
 					
-					std::wstring updateMsg = L"發現新版本可用！\n\n";
-					updateMsg += L"當前版本：V" + currentVersionW + L"\n";
+					std::wstring updateMsg = L"當前版本：V" + currentVersionW + L"\n";
 					updateMsg += L"最新版本：V" + remoteVersionW + L"\n\n";
-					updateMsg += L"是否前往 GitHub 下載最新版本？\n\n";
+					updateMsg += L"可前往 GitHub 下載最新版本：\n";
 					updateMsg += L"https://github.com/Yamazaki427858/ChineseStrokeIME";
 					
-					int result = MessageBoxW(hwnd, updateMsg.c_str(), 
-						L"版本更新通知", MB_YESNO | MB_ICONINFORMATION);
+					int result = showAutoVersionUpdateDialog(hwnd, updateMsg);
 					
-					if (result == IDYES) {
+					if (result == 1) {
 						ShellExecuteW(NULL, L"open", L"https://github.com/Yamazaki427858/ChineseStrokeIME", NULL, NULL, SW_SHOWNORMAL);
+					} else if (result == 3) {
+						g_state.suppressVersionUpdateReminder = true;
+						ConfigLoader::saveInterfaceConfig(g_state);
+						Utils::updateStatus(g_state, L"已設定：啟動時不再提醒版本更新（可於 user\\interfaceconfig.ini 改回）");
 					}
 				}
 				
@@ -3393,9 +4214,7 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 		
 		case WM_DISPLAYCHANGE:
-            ScreenManager::updateMonitorInfo();
-            positionMainWindow(g_state);
-            positionWindowsOptimized(g_state);
+            repositionImeWindowsForDisplayChange(g_state);
             return handleDisplayChange(hwnd);
 
         case WM_SETTINGCHANGE:
@@ -3612,18 +4431,9 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break; 
         }
 		
-		case WM_USER + 301: { // 新增：自定義螢幕模式變更消息
-			//bool isExtended = (wp == 1);
-    
-			// 立即處理模式變更
+		case WM_USER + 301: {
 			PositionManager::adjustPositionForScreenMode(g_state);
-    
-			// 確保視窗在正確位置
-			SetWindowPos(hwnd, HWND_TOPMOST,
-				PositionManager::g_toolbarPos.x,
-				PositionManager::g_toolbarPos.y,
-				0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
-    
+			repositionImeWindowsForDisplayChange(g_state);
 			return 0;
 		}
             
@@ -3782,7 +4592,7 @@ void positionInputWindow(GlobalState& state, const RECT* knownListRect) {
         return;
     }
     
-    if (!state.isInputting || (state.input.empty() && !state.showCand)) {
+    if (state.showPunctMenu || !state.isInputting || (state.input.empty() && !state.showCand)) {
         ShowWindow(state.hInputWnd, SW_HIDE);
         return;
     }

@@ -153,6 +153,9 @@ static void createDefaultConfigFile(GlobalState& state) {
     fout << "showScreenModeNotification=0" << std::endl;
     fout << "; 縮小顯示工作列（僅劃／E 兩鍵；於列上右鍵開啟選單）（0=關閉 預設）" << std::endl;
     fout << "toolbarClassicModeBadges=0" << std::endl;
+    fout << "; 啟動自動檢查版本：發現新版本時不再彈窗提醒（0=仍提醒 預設，1=不再提醒）" << std::endl;
+    fout << "; 改回 0 可恢復提醒；「關於」內的手動檢查不受此項影響" << std::endl;
+    fout << "suppress_version_update_reminder=0" << std::endl;
     fout << std::endl;
     fout << "[InputSettings]" << std::endl;
     fout << "; 萬用字元 * 觸發鍵（3+3 模式，支援：A-Z、NumPad0-9）" << std::endl;
@@ -419,6 +422,8 @@ void loadInterfaceConfig(GlobalState& state) {
                     state.showScreenModeNotification = (value == "1" || value == "true");
                 } else if (key == "toolbarClassicModeBadges") {
                     state.toolbarClassicModeBadges = (value == "1" || value == "true");
+                } else if (key == "suppress_version_update_reminder") {
+                    state.suppressVersionUpdateReminder = (value == "1" || value == "true");
                 }
             } else if (currentSection == "InputSettings") {
                 if (key == "auto_wildcard_length") {
@@ -514,6 +519,7 @@ void loadInterfaceConfig(GlobalState& state) {
 void loadAllConfigs(GlobalState& state) {
     loadInterfaceConfig(state);
     Dictionary::loadPunctMenu(state);
+    Dictionary::loadEmojiGroups(state);
     Utils::updateStatus(state, L"載入設定檔完成");
 }
 
@@ -525,6 +531,7 @@ void refreshConfigs(GlobalState& state) {
     Dictionary::loadMainDict(state);
     Dictionary::loadPunctuator(state);  // 載入標點符號表
     Dictionary::loadPunctMenu(state);    // 載入標點選單
+    Dictionary::loadEmojiGroups(state);  // 載入 Emoji 分類資料
     Dictionary::loadUserDict(state);     // 載入用戶字典
     Dictionary::loadWordPhrases(state);   // 載入詞語庫（用於聯想字功能）
     
@@ -556,6 +563,7 @@ void saveInterfaceConfig(const GlobalState& state) {
     bool foundMaxWordPredictions = false;
     bool foundShowStrokeSymbols = false;
     bool foundToolbarClassicModeBadges = false;
+    bool foundSuppressVersionUpdateReminder = false;
     bool foundEnableCustomStrokeKeys = false;
     bool foundEnableCustomNumpadStrokeKeys = false;
     std::string currentSection = "";
@@ -626,6 +634,10 @@ void saveInterfaceConfig(const GlobalState& state) {
                     } else if (key == "toolbarClassicModeBadges") {
                         lines.push_back("toolbarClassicModeBadges=" + (state.toolbarClassicModeBadges ? std::string("1") : std::string("0")));
                         foundToolbarClassicModeBadges = true;
+                        continue;
+                    } else if (key == "suppress_version_update_reminder") {
+                        lines.push_back("suppress_version_update_reminder=" + (state.suppressVersionUpdateReminder ? std::string("1") : std::string("0")));
+                        foundSuppressVersionUpdateReminder = true;
                         continue;
                     }
                 } else if (currentSection == "InputSettings") {
@@ -738,6 +750,9 @@ void saveInterfaceConfig(const GlobalState& state) {
                 if (!foundToolbarClassicModeBadges) {
                     toInsert.push_back("toolbarClassicModeBadges=" + (state.toolbarClassicModeBadges ? std::string("1") : std::string("0")));
                 }
+                if (!foundSuppressVersionUpdateReminder) {
+                    toInsert.push_back("suppress_version_update_reminder=" + (state.suppressVersionUpdateReminder ? std::string("1") : std::string("0")));
+                }
                 if (!toInsert.empty()) {
                     lines.insert(lines.begin() + i, toInsert.begin(), toInsert.end());
                 }
@@ -780,6 +795,9 @@ void saveInterfaceConfig(const GlobalState& state) {
                 if (!foundToolbarClassicModeBadges) {
                     toInsert.push_back("toolbarClassicModeBadges=" + (state.toolbarClassicModeBadges ? std::string("1") : std::string("0")));
                 }
+                if (!foundSuppressVersionUpdateReminder) {
+                    toInsert.push_back("suppress_version_update_reminder=" + (state.suppressVersionUpdateReminder ? std::string("1") : std::string("0")));
+                }
                 if (!toInsert.empty()) {
                     lines.insert(lines.begin() + insertPos, toInsert.begin(), toInsert.end());
                 }
@@ -815,6 +833,9 @@ void saveInterfaceConfig(const GlobalState& state) {
         if (!foundToolbarClassicModeBadges) {
             toInsert.push_back("toolbarClassicModeBadges=" + (state.toolbarClassicModeBadges ? std::string("1") : std::string("0")));
         }
+        if (!foundSuppressVersionUpdateReminder) {
+            toInsert.push_back("suppress_version_update_reminder=" + (state.suppressVersionUpdateReminder ? std::string("1") : std::string("0")));
+        }
         if (!toInsert.empty()) {
             lines.insert(lines.end(), toInsert.begin(), toInsert.end());
         }
@@ -838,6 +859,7 @@ void saveInterfaceConfig(const GlobalState& state) {
         }
         lines.push_back("showStrokeSymbols=" + (state.showStrokeSymbols ? std::string("1") : std::string("0")));
         lines.push_back("toolbarClassicModeBadges=" + (state.toolbarClassicModeBadges ? std::string("1") : std::string("0")));
+        lines.push_back("suppress_version_update_reminder=" + (state.suppressVersionUpdateReminder ? std::string("1") : std::string("0")));
     }
     
     // 寫回檔案
