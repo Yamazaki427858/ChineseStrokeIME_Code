@@ -33,7 +33,9 @@ jobs:
     - name: Build
       shell: msys2 {0}
       run: |
-        mingw32-make clean && mingw32-make
+        # MSYS2 下 make clean 的 cmd 語法會失敗，改在此直接清除再編譯
+        rm -f *.o ChineseStrokeIME.exe
+        mingw32-make
 
     - name: Package Release
       if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'
