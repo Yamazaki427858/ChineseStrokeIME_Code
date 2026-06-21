@@ -4091,14 +4091,14 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 				// 啟動時自動檢查版本更新（僅在程序啟動時執行一次）
 				KillTimer(hwnd, 994);
 
-				if (g_state.suppressVersionUpdateReminder) {
-					return 0;
-				}
-				
-				// 檢查版本（使用緩存，但如果緩存過期會自動從 GitHub 獲取）
+				// 一律刷新快取（含「不再提醒」時靜默更新，避免舊兩欄快取残留）
 				std::string currentVersion = APP_VERSION;
 				std::string versionCachePath = Utils::wstrToUtf8(g_state.systemDir + L"version_cache.txt");
 				std::string remoteVersion = DictUpdater::getRemoteVersion(nullptr, false, 24, versionCachePath.c_str());
+
+				if (g_state.suppressVersionUpdateReminder) {
+					return 0;
+				}
 				
 				// 如果發現新版本，顯示通知
 				if (!remoteVersion.empty() && remoteVersion != currentVersion) {

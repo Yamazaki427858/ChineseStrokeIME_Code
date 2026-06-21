@@ -311,9 +311,48 @@ std::wstring getStatusMessage(const DownloadResult& result) {
     return ss.str();
 }
 
+static const char* resolveVersionCachePath(const char* cachePath) {
+    return (cachePath && cachePath[0]) ? cachePath : VERSION_CACHE_FILE;
+}
+
+// 刪除無效快取：舊版兩欄、或寫入時本地版本與目前 APP_VERSION 不符
+static void purgeInvalidVersionCache(const char* cachePath) {
+    const char* path = resolveVersionCachePath(cachePath);
+    std::ifstream inFile(path);
+    if (!inFile.is_open()) return;
+
+    std::string line;
+    std::getline(inFile, line);
+    inFile.close();
+    if (line.empty()) return;
+
+    size_t pos1 = line.find('|');
+    if (pos1 == std::string::npos || pos1 >= line.length() - 1) {
+        DeleteFileA(path);
+        return;
+    }
+
+    size_t pos2 = line.find('|', pos1 + 1);
+    if (pos2 == std::string::npos) {
+        // 舊版兩欄（如 3.2.0|1782059990）：升級 exe 後必須刪除，否則仍可能誤判有更新
+        DeleteFileA(path);
+        return;
+    }
+
+    std::string cachedLocalApp = line.substr(pos2 + 1);
+    while (!cachedLocalApp.empty() &&
+           (cachedLocalApp.back() == '\r' || cachedLocalApp.back() == '\n' ||
+            cachedLocalApp.back() == ' ' || cachedLocalApp.back() == '\t')) {
+        cachedLocalApp.pop_back();
+    }
+    if (cachedLocalApp.empty() || cachedLocalApp != APP_VERSION) {
+        DeleteFileA(path);
+    }
+}
+
 // 保存版本检查缓存（含写入当下的本地 APP_VERSION，供升级后失效旧缓存）
 void saveVersionCache(const std::string& version, time_t checkTime, const char* cachePath) {
-    const char* path = (cachePath && cachePath[0]) ? cachePath : VERSION_CACHE_FILE;
+    const char* path = resolveVersionCachePath(cachePath);
     std::ofstream outFile(path);
     if (!outFile.is_open()) return;
     
@@ -323,7 +362,7 @@ void saveVersionCache(const std::string& version, time_t checkTime, const char* 
 
 // 加载版本检查缓存
 std::string loadVersionCache(time_t& checkTime, int cacheHours, const char* cachePath) {
-    const char* path = (cachePath && cachePath[0]) ? cachePath : VERSION_CACHE_FILE;
+    const char* path = resolveVersionCachePath(cachePath);
     std::ifstream inFile(path);
     if (!inFile.is_open()) return "";
     
@@ -369,6 +408,8 @@ std::string loadVersionCache(time_t& checkTime, int cacheHours, const char* cach
 
 // 获取远程版本号（从 Update.md，带缓存机制）
 std::string getRemoteVersion(const char* updateUrl, bool forceCheck, int cacheHours, const char* versionCachePath) {
+    purgeInvalidVersionCache(versionCachePath);
+
     // 如果不强制检查，先尝试从缓存加载
     if (!forceCheck) {
         time_t cachedTime = 0;
