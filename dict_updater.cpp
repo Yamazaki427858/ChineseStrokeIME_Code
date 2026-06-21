@@ -311,13 +311,13 @@ std::wstring getStatusMessage(const DownloadResult& result) {
     return ss.str();
 }
 
-// 保存版本检查缓存
+// 保存版本检查缓存（含写入当下的本地 APP_VERSION，供升级后失效旧缓存）
 void saveVersionCache(const std::string& version, time_t checkTime, const char* cachePath) {
     const char* path = (cachePath && cachePath[0]) ? cachePath : VERSION_CACHE_FILE;
     std::ofstream outFile(path);
     if (!outFile.is_open()) return;
     
-    outFile << version << "|" << checkTime;
+    outFile << version << "|" << checkTime << "|" << APP_VERSION;
     outFile.close();
 }
 
@@ -333,12 +333,21 @@ std::string loadVersionCache(time_t& checkTime, int cacheHours, const char* cach
     
     if (line.empty()) return "";
     
-    // 解析格式：版本号|时间戳
-    size_t pos = line.find('|');
-    if (pos == std::string::npos || pos >= line.length() - 1) return "";
+    // 解析格式：遠端版本|時間戳|寫入時本地APP_VERSION（舊版僅兩欄，一律視為失效）
+    size_t pos1 = line.find('|');
+    if (pos1 == std::string::npos || pos1 >= line.length() - 1) return "";
     
-    std::string version = line.substr(0, pos);
-    std::string timeStr = line.substr(pos + 1);
+    size_t pos2 = line.find('|', pos1 + 1);
+    if (pos2 == std::string::npos || pos2 >= line.length() - 1) return "";
+    
+    std::string version = line.substr(0, pos1);
+    std::string timeStr = line.substr(pos1 + 1, pos2 - pos1 - 1);
+    std::string cachedLocalApp = line.substr(pos2 + 1);
+    
+    if (version.empty() || cachedLocalApp.empty()) return "";
+    
+    // 本地程式已升级/变更：旧缓存的远程版本不再可信，强制重新抓取
+    if (cachedLocalApp != APP_VERSION) return "";
     
     try {
         checkTime = static_cast<time_t>(std::stoll(timeStr));
@@ -352,7 +361,6 @@ std::string loadVersionCache(time_t& checkTime, int cacheHours, const char* cach
     int cacheSeconds = cacheHours * 3600;
     
     if (cacheAge < 0 || cacheAge > cacheSeconds) {
-        // 缓存过期
         return "";
     }
     

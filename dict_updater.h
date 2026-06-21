@@ -37,7 +37,7 @@ namespace DictUpdater {
     // 本地文件名
     const char* const LOCAL_DICT_FILE = "Zi-Ma-Biao.txt";
     const char* const TEMP_DICT_FILE = "Zi-Ma-Biao.txt.tmp";
-    const char* const VERSION_CACHE_FILE = "version_cache.txt";  // 版本检查缓存文件
+    const char* const VERSION_CACHE_FILE = "version_cache.txt";  // 格式：遠端版本|時間戳|寫入時本地APP_VERSION
     
     // 从GitHub下载字码表
     // downloadUrl: 下载URL（如果为空则使用默认GitHub URL）
@@ -72,7 +72,7 @@ namespace DictUpdater {
     void saveVersionCache(const std::string& version, time_t checkTime, const char* cachePath = nullptr);
     
     // 加载版本检查缓存（内部使用；cachePath 為空時使用 VERSION_CACHE_FILE）
-    // 返回缓存的版本号，如果缓存过期或不存在返回空字符串
+    // 返回缓存的远程版本号；过期、本地 APP_VERSION 已变更、或旧格式无第三栏位时返回空字符串
     std::string loadVersionCache(time_t& checkTime, int cacheHours = 24, const char* cachePath = nullptr);
 }
 
