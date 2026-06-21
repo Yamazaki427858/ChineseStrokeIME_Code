@@ -17,6 +17,11 @@
 ⌨️操作方式：鍵盤UIOJK 和 數字鍵盤78945 對應五種基本筆劃（一丨丿丶フ）
 <br>
 <br>
+
+[👉 點此查看 中文筆劃輸入法 完整使用說明](http://github.com/Yamazaki427858/ChineseStrokeIME_Releases/blob/main/%E4%B8%AD%E6%96%87%E7%AD%86%E5%8A%83%E8%BC%B8%E5%85%A5%E6%B3%95%20%E4%BD%BF%E7%94%A8%E8%AA%AA%E6%98%8E.md)
+
+<br>
+<br>
 [![CodeQL](https://github.com/Yamazaki427858/ChineseStrokeIME_Releases/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/Yamazaki427858/ChineseStrokeIME_Releases/actions/workflows/github-code-scanning/codeql)
 [![Latest Release](https://img.shields.io/github/v/release/Yamazaki427858/ChineseStrokeIME_Releases)](https://github.com/Yamazaki427858/ChineseStrokeIME_Releases/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/Yamazaki427858/ChineseStrokeIME_Releases/total)](https://github.com/Yamazaki427858/ChineseStrokeIME_Releases/releases)
