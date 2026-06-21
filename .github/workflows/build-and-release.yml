@@ -33,7 +33,7 @@ jobs:
     - name: Build
       shell: msys2 {0}
       run: |
-        mingw32-make
+        mingw32-make clean && mingw32-make
 
     - name: Package Release
       if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'
@@ -56,4 +56,3 @@ jobs:
       uses: softprops/action-gh-release@v3
       with:
         files: ChineseStrokeIME_Release.zip
-        generate_release_notes: true
