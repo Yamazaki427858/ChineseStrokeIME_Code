@@ -26,6 +26,10 @@ namespace Utils {
         if (state.hWnd) InvalidateRect(state.hWnd, nullptr, TRUE);
     }
 
+    void setStatusMessage(GlobalState& state, const std::wstring& msg) {
+        state.statusInfo = msg;
+    }
+
     bool isPunctuation(const std::wstring& word) {
         if (word.empty()) return false;
         

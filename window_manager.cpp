@@ -22,6 +22,49 @@ static const UINT DEFERRED_INVALIDATE_TIMER_ID = 992;
 static const UINT DEFERRED_MAIN = 1, DEFERRED_CAND = 2, DEFERRED_PRED = 4, DEFERRED_BUFFER = 8;
 static UINT g_deferredInvalidateFlags = 0;
 static bool g_deferredInvalidateScheduled = false;
+struct PaintBackBuffer {
+    HDC dc = NULL;
+    HBITMAP bmp = NULL;
+    int width = 0;
+    int height = 0;
+};
+static PaintBackBuffer g_candBackBuffer;
+static PaintBackBuffer g_predBackBuffer;
+static PaintBackBuffer g_bufferBackBuffer;
+static PaintBackBuffer g_toolbarBackBuffer;
+static PaintBackBuffer g_inputBackBuffer;
+
+static HDC getBackBufferDC(HDC paintDC, int width, int height, PaintBackBuffer& backBuffer) {
+    if (!paintDC || width <= 0 || height <= 0) return NULL;
+    if (!backBuffer.dc) {
+        backBuffer.dc = CreateCompatibleDC(paintDC);
+        if (!backBuffer.dc) return NULL;
+    }
+    if (!backBuffer.bmp || backBuffer.width != width || backBuffer.height != height) {
+        HBITMAP newBmp = CreateCompatibleBitmap(paintDC, width, height);
+        if (!newBmp) return NULL;
+        HBITMAP oldBmp = (HBITMAP)SelectObject(backBuffer.dc, newBmp);
+        if (backBuffer.bmp) DeleteObject(oldBmp);
+        backBuffer.bmp = newBmp;
+        backBuffer.width = width;
+        backBuffer.height = height;
+    }
+    return backBuffer.dc;
+}
+
+static void freeBackBuffer(PaintBackBuffer& backBuffer) {
+    if (backBuffer.dc && backBuffer.bmp) {
+        DeleteObject(backBuffer.bmp);
+        backBuffer.bmp = NULL;
+    }
+    if (backBuffer.dc) {
+        DeleteDC(backBuffer.dc);
+        backBuffer.dc = NULL;
+    }
+    backBuffer.width = 0;
+    backBuffer.height = 0;
+}
+
 static void scheduleDeferredInvalidate(UINT mask) {
     g_deferredInvalidateFlags |= mask;
     if (!g_deferredInvalidateScheduled && g_state.hWnd) {
@@ -826,7 +869,7 @@ bool handleEmojiPickerClick(GlobalState& state, int x, int y) {
     }
     if (pointInRect(x, y, state.emojiCatPrevRect) && state.emojiCategoryScroll > 0) {
         state.emojiCategoryScroll--;
-        if (state.hCandWnd) InvalidateRect(state.hCandWnd, nullptr, TRUE);
+        scheduleDeferredInvalidate(DEFERRED_CAND);
         return true;
     }
     if (pointInRect(x, y, state.emojiCatNextRect)) {
@@ -837,7 +880,7 @@ bool handleEmojiPickerClick(GlobalState& state, int x, int y) {
         int maxVisible = std::max(1, (catRight - catLeft) / emojiCategoryTabW(state));
         if (state.emojiCategoryScroll + maxVisible < (int)state.emojiGroups.size()) {
             state.emojiCategoryScroll++;
-            if (state.hCandWnd) InvalidateRect(state.hCandWnd, nullptr, TRUE);
+            scheduleDeferredInvalidate(DEFERRED_CAND);
         }
         return true;
     }
@@ -846,7 +889,7 @@ bool handleEmojiPickerClick(GlobalState& state, int x, int y) {
             int gi = state.emojiCategoryScroll + (int)vi;
             Dictionary::applyEmojiGroupDisplay(state, gi);
             positionWindowsOptimized(state);
-            if (state.hCandWnd) InvalidateRect(state.hCandWnd, nullptr, TRUE);
+            scheduleDeferredInvalidate(DEFERRED_CAND);
             return true;
         }
     }
@@ -1262,8 +1305,7 @@ place_cand_window:
                         candWidth, candHeight,
                         SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
-        InvalidateRect(state.hCandWnd, nullptr, TRUE);
-        UpdateWindow(state.hCandWnd);
+        InvalidateRect(state.hCandWnd, nullptr, FALSE);
         
         RECT knownListRect = { basePos.x, basePos.y, basePos.x + candWidth, basePos.y + candHeight };
         if (state.showPunctMenu) {
@@ -2029,6 +2071,12 @@ LRESULT handleDisplayChange(HWND hwnd) {
 // 處理窗口銷毀 (WM_DESTROY)
 LRESULT handleWindowDestroy(HWND hwnd) {
     // 清理資源
+    freeBackBuffer(g_toolbarBackBuffer);
+    freeBackBuffer(g_candBackBuffer);
+    freeBackBuffer(g_predBackBuffer);
+    freeBackBuffer(g_bufferBackBuffer);
+    freeBackBuffer(g_inputBackBuffer);
+
     if (g_hKeyboardHook) {
         UnhookWindowsHookEx(g_hKeyboardHook);
         g_hKeyboardHook = NULL;
@@ -2081,22 +2129,29 @@ LRESULT CALLBACK CandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             HDC hdc = BeginPaint(hwnd, &ps); 
             RECT rc;
             GetClientRect(hwnd, &rc);
-            // 進階優化：雙緩衝繪製，減少閃爍
-            HDC memDC = CreateCompatibleDC(hdc);
-            HBITMAP memBitmap = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
-            HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
-            if (g_state.showPunctMenu) {
-                drawEmojiPicker(hwnd, memDC, g_state);
+            // 進階優化：重用雙緩衝位圖，避免每次重建 GDI 資源
+            HDC memDC = getBackBufferDC(hdc, rc.right, rc.bottom, g_candBackBuffer);
+            if (memDC) {
+                if (g_state.showPunctMenu) {
+                    drawEmojiPicker(hwnd, memDC, g_state);
+                } else {
+                    drawCandidate(hwnd, memDC, g_state);
+                }
+                BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
             } else {
-                drawCandidate(hwnd, memDC, g_state);
+                if (g_state.showPunctMenu) {
+                    drawEmojiPicker(hwnd, hdc, g_state);
+                } else {
+                    drawCandidate(hwnd, hdc, g_state);
+                }
             }
-            BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
-            SelectObject(memDC, oldBitmap);
-            DeleteObject(memBitmap);
-            DeleteDC(memDC);
             EndPaint(hwnd, &ps); 
             return 0; 
         }
+
+        case WM_NCDESTROY:
+            freeBackBuffer(g_candBackBuffer);
+            break;
             
         case WM_LBUTTONDOWN: { 
             int x = LOWORD(lp);
@@ -2393,18 +2448,20 @@ LRESULT CALLBACK PredProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             HDC hdc = BeginPaint(hwnd, &ps); 
             RECT rc;
             GetClientRect(hwnd, &rc);
-            // 進階優化：雙緩衝繪製，減少閃爍
-            HDC memDC = CreateCompatibleDC(hdc);
-            HBITMAP memBitmap = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
-            HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
-            drawPrediction(hwnd, memDC, g_state); 
-            BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
-            SelectObject(memDC, oldBitmap);
-            DeleteObject(memBitmap);
-            DeleteDC(memDC);
+            HDC memDC = getBackBufferDC(hdc, rc.right, rc.bottom, g_predBackBuffer);
+            if (memDC) {
+                drawPrediction(hwnd, memDC, g_state);
+                BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
+            } else {
+                drawPrediction(hwnd, hdc, g_state);
+            }
             EndPaint(hwnd, &ps); 
             return 0; 
         }
+
+        case WM_NCDESTROY:
+            freeBackBuffer(g_predBackBuffer);
+            break;
             
         case WM_LBUTTONDOWN: { 
             int x = LOWORD(lp);
@@ -2666,10 +2723,23 @@ void drawTextWithSelection(HDC hdc, RECT textArea, GlobalState& state) {
     int selStart = state.hasSelection ? std::min(state.selectionStart, state.selectionEnd) : -1;
     int selEnd = state.hasSelection ? std::max(state.selectionStart, state.selectionEnd) : -1;
     
-    for (int i = 0; i < (int)state.bufferText.length(); i++) {
-        wchar_t ch = state.bufferText[i];
+    for (int i = 0; i < (int)state.bufferText.length();) {
+        int clusterLen = 1;
+        if (i + 1 < (int)state.bufferText.length() &&
+            state.bufferText[i] >= 0xD800 && state.bufferText[i] <= 0xDBFF &&
+            state.bufferText[i + 1] >= 0xDC00 && state.bufferText[i + 1] <= 0xDFFF) {
+            clusterLen = 2;
+        }
+        const wchar_t* ch = state.bufferText.c_str() + i;
+        HFONT hSavedFont = NULL;
+        if (clusterLen == 2) {
+            HFONT hEmojiFont = getEmojiFont(std::max(14, state.bufferFontSize));
+            if (hEmojiFont) {
+                hSavedFont = (HFONT)SelectObject(hdc, hEmojiFont);
+            }
+        }
         SIZE charSize;
-        GetTextExtentPoint32W(hdc, &ch, 1, &charSize);
+        GetTextExtentPoint32W(hdc, ch, clusterLen, &charSize);
         
         // 檢查是否需要換行
         if (currentX + charSize.cx > textArea.right) {
@@ -2683,7 +2753,13 @@ void drawTextWithSelection(HDC hdc, RECT textArea, GlobalState& state) {
         }
         
         // 繪製選取背景
-        if (state.hasSelection && i >= selStart && i < selEnd) {
+        bool inSelection = false;
+        if (state.hasSelection) {
+            int clusterStart = i;
+            int clusterEnd = i + clusterLen;
+            inSelection = (clusterStart < selEnd && clusterEnd > selStart);
+        }
+        if (inSelection) {
             RECT charRect = {currentX, currentY, currentX + charSize.cx, currentY + state.bufferFontSize};
             HBRUSH hSelBrush = CreateSolidBrush(RGB(51, 153, 255)); // 藍色選取背景
             FillRect(hdc, &charRect, hSelBrush);
@@ -2697,9 +2773,13 @@ void drawTextWithSelection(HDC hdc, RECT textArea, GlobalState& state) {
         }
         
         // 繪製字符
-        TextOutW(hdc, currentX, currentY, &ch, 1);
+        TextOutW(hdc, currentX, currentY, ch, clusterLen);
+        if (hSavedFont) {
+            SelectObject(hdc, hSavedFont);
+        }
         
         currentX += charSize.cx;
+        i += clusterLen;
     }
     
     SelectObject(hdc, hOldFont);
@@ -2939,22 +3019,21 @@ LRESULT CALLBACK BufferProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RECT rc;
             GetClientRect(hwnd, &rc);
             
-            // 双缓冲绘制
-            HDC memDC = CreateCompatibleDC(hdc);
-            HBITMAP memBitmap = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
-            HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
-            
-            drawBufferWindow(memDC, rc, g_state);
-            
-            BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
-            
-            SelectObject(memDC, oldBitmap);
-            DeleteObject(memBitmap);
-            DeleteDC(memDC);
+            HDC memDC = getBackBufferDC(hdc, rc.right, rc.bottom, g_bufferBackBuffer);
+            if (memDC) {
+                drawBufferWindow(memDC, rc, g_state);
+                BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
+            } else {
+                drawBufferWindow(hdc, rc, g_state);
+            }
             
             EndPaint(hwnd, &ps);
             return 0;
         }
+
+        case WM_NCDESTROY:
+            freeBackBuffer(g_bufferBackBuffer);
+            break;
         
         case WM_LBUTTONDOWN: {
     int x = LOWORD(lp); 
@@ -4031,10 +4110,10 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 			if (wp == DEFERRED_INVALIDATE_TIMER_ID) {
 				KillTimer(hwnd, DEFERRED_INVALIDATE_TIMER_ID);
 				g_deferredInvalidateScheduled = false;
-				if (g_deferredInvalidateFlags & DEFERRED_MAIN && g_state.hWnd) InvalidateRect(g_state.hWnd, nullptr, TRUE);
-				if (g_deferredInvalidateFlags & DEFERRED_CAND && g_state.hCandWnd) InvalidateRect(g_state.hCandWnd, nullptr, TRUE);
-				if (g_deferredInvalidateFlags & DEFERRED_PRED && g_state.hPredWnd) InvalidateRect(g_state.hPredWnd, nullptr, TRUE);
-				if (g_deferredInvalidateFlags & DEFERRED_BUFFER && g_state.hBufferWnd) InvalidateRect(g_state.hBufferWnd, nullptr, TRUE);
+				if (g_deferredInvalidateFlags & DEFERRED_MAIN && g_state.hWnd) InvalidateRect(g_state.hWnd, nullptr, FALSE);
+				if (g_deferredInvalidateFlags & DEFERRED_CAND && g_state.hCandWnd) InvalidateRect(g_state.hCandWnd, nullptr, FALSE);
+				if (g_deferredInvalidateFlags & DEFERRED_PRED && g_state.hPredWnd) InvalidateRect(g_state.hPredWnd, nullptr, FALSE);
+				if (g_deferredInvalidateFlags & DEFERRED_BUFFER && g_state.hBufferWnd) InvalidateRect(g_state.hBufferWnd, nullptr, FALSE);
 				g_deferredInvalidateFlags = 0;
 				return 0;
 			}
@@ -4228,6 +4307,10 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_USER+100:
             return handleKeyboardInput(hwnd, wp);
+
+        case WM_USER+105:
+            InputHandler::processQueuedTextDirectUnicode();
+            return 0;
 		
 		case WM_USER+200:
 			return handleTrayMessage(hwnd, lp);
@@ -4238,21 +4321,13 @@ LRESULT CALLBACK OptimizedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RECT rc;
             GetClientRect(hwnd, &rc);
             
-            // 使用雙緩衝繪製以避免閃爍
-            HDC memDC = CreateCompatibleDC(hdc);
-            HBITMAP memBitmap = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
-            HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
-            
-            // 在記憶體DC上繪製
-            drawOptimizedToolbar(memDC, rc, g_state);
-            
-            // 將記憶體DC的內容複製到實際DC
-            BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
-            
-            // 清理資源
-            SelectObject(memDC, oldBitmap);
-            DeleteObject(memBitmap);
-            DeleteDC(memDC);
+            HDC memDC = getBackBufferDC(hdc, rc.right, rc.bottom, g_toolbarBackBuffer);
+            if (memDC) {
+                drawOptimizedToolbar(memDC, rc, g_state);
+                BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
+            } else {
+                drawOptimizedToolbar(hdc, rc, g_state);
+            }
             
             EndPaint(hwnd, &ps);
             return 0;
@@ -4481,10 +4556,20 @@ LRESULT CALLBACK InputProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             HDC hdc = BeginPaint(hwnd, &ps);
             RECT rc;
             GetClientRect(hwnd, &rc);
-            drawInputWindow(hdc, rc, g_state);
+            HDC memDC = getBackBufferDC(hdc, rc.right, rc.bottom, g_inputBackBuffer);
+            if (memDC) {
+                drawInputWindow(memDC, rc, g_state);
+                BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
+            } else {
+                drawInputWindow(hdc, rc, g_state);
+            }
             EndPaint(hwnd, &ps);
             return 0;
         }
+
+        case WM_NCDESTROY:
+            freeBackBuffer(g_inputBackBuffer);
+            break;
         
         case WM_LBUTTONDOWN: {
             // 開始拖拽字碼輸入視窗

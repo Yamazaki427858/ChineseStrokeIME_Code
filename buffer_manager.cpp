@@ -11,6 +11,44 @@ namespace BufferManager {
 static const size_t MAX_BUFFER_FILE_BYTES = 2 * 1024 * 1024;   // 防止誤讀到大型二進位檔
 static const size_t MAX_BUFFER_TEXT_CHARS = 200000;            // 防止異常內容撐爆 UI
 
+static bool isHighSurrogate(wchar_t ch) {
+    return ch >= 0xD800 && ch <= 0xDBFF;
+}
+
+static bool isLowSurrogate(wchar_t ch) {
+    return ch >= 0xDC00 && ch <= 0xDFFF;
+}
+
+static int normalizeCursorPos(const std::wstring& text, int pos) {
+    if (pos < 0) pos = 0;
+    if (pos > (int)text.length()) pos = (int)text.length();
+    // 避免游標停在代理對中間（高代理之後、低代理之前）
+    if (pos > 0 && pos < (int)text.length() &&
+        isLowSurrogate(text[pos]) && isHighSurrogate(text[pos - 1])) {
+        pos++;
+        if (pos > (int)text.length()) pos = (int)text.length();
+    }
+    return pos;
+}
+
+static int codeUnitStepForward(const std::wstring& text, int pos) {
+    if (pos < 0 || pos >= (int)text.length()) return 0;
+    if (pos + 1 < (int)text.length() &&
+        isHighSurrogate(text[pos]) && isLowSurrogate(text[pos + 1])) {
+        return 2;
+    }
+    return 1;
+}
+
+static int codeUnitStepBackward(const std::wstring& text, int pos) {
+    if (pos <= 0 || pos > (int)text.length()) return 0;
+    if (pos - 2 >= 0 &&
+        isHighSurrogate(text[pos - 2]) && isLowSurrogate(text[pos - 1])) {
+        return 2;
+    }
+    return 1;
+}
+
 static bool decodeUtf8Strict(const std::string& utf8, std::wstring& out) {
     out.clear();
     if (utf8.empty()) return true;
@@ -248,12 +286,11 @@ void toggleBufferMode(GlobalState& state) {
 
 void insertTextAtCursor(GlobalState& state, const std::wstring& text) {
 	saveSnapshot(state);
-    if (state.bufferCursorPos < 0) state.bufferCursorPos = 0;
-    if (state.bufferCursorPos > (int)state.bufferText.length()) 
-        state.bufferCursorPos = state.bufferText.length();
+    state.bufferCursorPos = normalizeCursorPos(state.bufferText, state.bufferCursorPos);
     
     state.bufferText.insert(state.bufferCursorPos, text);
     state.bufferCursorPos += text.length();
+    state.bufferCursorPos = normalizeCursorPos(state.bufferText, state.bufferCursorPos);
     
     saveBufferToFile(state);
     
@@ -325,16 +362,25 @@ void deleteCharAtCursor(GlobalState& state, bool forward) {
         return;
     }
 	
+    state.bufferCursorPos = normalizeCursorPos(state.bufferText, state.bufferCursorPos);
+
     if (forward) {
         if (state.bufferCursorPos < (int)state.bufferText.length()) {
-            state.bufferText.erase(state.bufferCursorPos, 1);
+            int eraseLen = codeUnitStepForward(state.bufferText, state.bufferCursorPos);
+            if (eraseLen <= 0) eraseLen = 1;
+            state.bufferText.erase(state.bufferCursorPos, eraseLen);
         }
     } else {
         if (state.bufferCursorPos > 0) {
-            state.bufferText.erase(state.bufferCursorPos - 1, 1);
-            state.bufferCursorPos--;
+            int step = codeUnitStepBackward(state.bufferText, state.bufferCursorPos);
+            if (step <= 0) step = 1;
+            int eraseStart = state.bufferCursorPos - step;
+            state.bufferText.erase(eraseStart, step);
+            state.bufferCursorPos = eraseStart;
         }
     }
+
+    state.bufferCursorPos = normalizeCursorPos(state.bufferText, state.bufferCursorPos);
     
     saveBufferToFile(state);
     
@@ -378,11 +424,15 @@ void deleteCharAtCursor(GlobalState& state, bool forward) {
 }
 
 void moveCursor(GlobalState& state, int direction) {
-    int newPos = state.bufferCursorPos + direction;
-    if (newPos < 0) newPos = 0;
-    if (newPos > (int)state.bufferText.length()) newPos = state.bufferText.length();
-    
-    state.bufferCursorPos = newPos;
+    int newPos = normalizeCursorPos(state.bufferText, state.bufferCursorPos);
+    if (direction > 0) {
+        int step = codeUnitStepForward(state.bufferText, newPos);
+        if (step > 0) newPos += step;
+    } else if (direction < 0) {
+        int step = codeUnitStepBackward(state.bufferText, newPos);
+        if (step > 0) newPos -= step;
+    }
+    state.bufferCursorPos = normalizeCursorPos(state.bufferText, newPos);
     
     if (state.hBufferWnd) {
         InvalidateRect(state.hBufferWnd, nullptr, TRUE);
@@ -411,8 +461,9 @@ void setCursorPosition(GlobalState& state, int x, int y) {
     
     int currentX = 0;
     int currentY = 0;
+    int lineHeight = state.bufferFontSize + 2;
     
-    for (int i = 0; i <= (int)state.bufferText.length(); i++) {
+    for (int i = 0; i <= (int)state.bufferText.length();) {
         int distance = abs(currentX - clickX) + abs(currentY - clickY) * 2;
         if (distance < minDistance) {
             minDistance = distance;
@@ -420,20 +471,25 @@ void setCursorPosition(GlobalState& state, int x, int y) {
         }
         
         if (i < (int)state.bufferText.length()) {
-            wchar_t ch = state.bufferText[i];
+            int step = codeUnitStepForward(state.bufferText, i);
+            if (step <= 0) step = 1;
+            const wchar_t* ch = state.bufferText.c_str() + i;
             SIZE charSize;
-            GetTextExtentPoint32W(hdc, &ch, 1, &charSize);
+            GetTextExtentPoint32W(hdc, ch, step, &charSize);
             
             currentX += charSize.cx;
             
             if (currentX > (FIXED_WIDTH - 30)) {
                 currentX = charSize.cx;
-                currentY += state.bufferFontSize + 2;
+                currentY += lineHeight;
             }
+            i += step;
+        } else {
+            break;
         }
     }
     
-    state.bufferCursorPos = bestPos;
+    state.bufferCursorPos = normalizeCursorPos(state.bufferText, bestPos);
     
     SelectObject(hdc, hOldFont);
     DeleteObject(hFont);
@@ -749,7 +805,7 @@ int getTextPositionFromPoint(const GlobalState& state, int x, int y) {
     int currentY = 0;
     int lineHeight = state.bufferFontSize + 2;
     
-    for (int i = 0; i <= (int)state.bufferText.length(); i++) {
+    for (int i = 0; i <= (int)state.bufferText.length();) {
         int distance = abs(currentX - clickX) + abs(currentY - clickY);
         if (distance < minDistance) {
             minDistance = distance;
@@ -757,9 +813,11 @@ int getTextPositionFromPoint(const GlobalState& state, int x, int y) {
         }
         
         if (i < (int)state.bufferText.length()) {
-            wchar_t ch = state.bufferText[i];
+            int step = codeUnitStepForward(state.bufferText, i);
+            if (step <= 0) step = 1;
+            const wchar_t* ch = state.bufferText.c_str() + i;
             SIZE charSize;
-            GetTextExtentPoint32W(hdc, &ch, 1, &charSize);
+            GetTextExtentPoint32W(hdc, ch, step, &charSize);
             
             currentX += charSize.cx;
             
@@ -767,6 +825,9 @@ int getTextPositionFromPoint(const GlobalState& state, int x, int y) {
                 currentX = charSize.cx;
                 currentY += lineHeight;
             }
+            i += step;
+        } else {
+            break;
         }
     }
     
@@ -774,13 +835,14 @@ int getTextPositionFromPoint(const GlobalState& state, int x, int y) {
     DeleteObject(hFont);
     ReleaseDC(state.hBufferWnd, hdc);
     
-    return bestPos;
+    return normalizeCursorPos(state.bufferText, bestPos);
 }
 
 POINT getPointFromTextPosition(const GlobalState& state, int position) {
     POINT pt = {10, 10};
     
-    if (!state.hBufferWnd || position < 0 || position > (int)state.bufferText.length()) {
+    int normalizedPos = normalizeCursorPos(state.bufferText, position);
+    if (!state.hBufferWnd || normalizedPos < 0 || normalizedPos > (int)state.bufferText.length()) {
         return pt;
     }
     
@@ -796,10 +858,13 @@ POINT getPointFromTextPosition(const GlobalState& state, int position) {
     int currentY = 10;
     int lineHeight = state.bufferFontSize + 2;
     
-    for (int i = 0; i < position && i < (int)state.bufferText.length(); i++) {
-        wchar_t ch = state.bufferText[i];
+    for (int i = 0; i < normalizedPos && i < (int)state.bufferText.length();) {
+        int step = codeUnitStepForward(state.bufferText, i);
+        if (step <= 0) step = 1;
+        if (i + step > normalizedPos) break;
+        const wchar_t* ch = state.bufferText.c_str() + i;
         SIZE charSize;
-        GetTextExtentPoint32W(hdc, &ch, 1, &charSize);
+        GetTextExtentPoint32W(hdc, ch, step, &charSize);
         
         currentX += charSize.cx;
         
@@ -807,6 +872,7 @@ POINT getPointFromTextPosition(const GlobalState& state, int position) {
             currentX = 10 + charSize.cx;
             currentY += lineHeight;
         }
+        i += step;
     }
     
     pt.x = currentX;

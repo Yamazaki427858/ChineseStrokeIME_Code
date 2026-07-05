@@ -35,6 +35,8 @@ namespace InputHandler {
     
     // 文字發送
     void sendTextDirectUnicode(const std::wstring& text);
+    void queueTextDirectUnicode(const std::wstring& text);
+    void processQueuedTextDirectUnicode();
     /// 向前景焦點視窗送出一個退格（用於刪除剛上屏的聯想字）
     void sendBackspaceToForeground();
     

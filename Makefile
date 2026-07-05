@@ -18,5 +18,9 @@ $(TARGET): $(OBJS)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 clean:
+ifdef MSYSTEM
+	rm -f $(OBJS) $(TARGET)
+else
 	@if exist *.o del /F /Q *.o 2>nul
 	@if exist $(TARGET) del /F /Q $(TARGET) 2>nul
+endif

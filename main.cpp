@@ -33,6 +33,10 @@ static void initDirectories(GlobalState& state) {
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShowCmd) {
     try {
+        // 低延遲優化：提高本程序與主執行緒優先級，降低混合架構 CPU 的排程抖動
+        SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
         initDirectories(g_state);
 
         // 初始化輸入法管理器（避免與 Windows 輸入法衝突）

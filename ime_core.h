@@ -25,7 +25,7 @@ enum class InputMode {
 // 例如：3.1.0、Beta4.0.a、3.0.0-alpha、v2.0.0-beta.1 等均可
 // 版本比較：使用字符串比較，只要字符串不同即判定為不同版本
 //
-#define APP_VERSION "3.3.0"
+#define APP_VERSION "3.3.1"
 // ========== 【版本號定義結束】 ==========
 
 // 常數定義
@@ -446,6 +446,7 @@ namespace Utils {
     std::wstring utf8ToWstr(const std::string& str);
     std::string wstrToUtf8(const std::wstring& ws);
     void updateStatus(GlobalState& state, const std::wstring& msg);
+    void setStatusMessage(GlobalState& state, const std::wstring& msg);
     bool isPunctuation(const std::wstring& word);
     /// 句讀中斷（。?! 等）：應斷絕多字前綴與跨句聯想文脈
     bool isStrongContextBreakPunct(const std::wstring& word);

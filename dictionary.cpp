@@ -703,16 +703,36 @@ void loadEmojiGroups(GlobalState& state) {
     }
 }
 
+namespace {
+
+DWORD g_lastEmojiStatusPaintTick = 0;
+const DWORD kEmojiStatusPaintIntervalMs = 400;
+
+void refreshEmojiInsertStatus(GlobalState& state, bool bufferMode) {
+    const std::wstring msg = bufferMode
+        ? L"已插入 Emoji（選單仍開啟，ESC 關閉）"
+        : L"已插入 Emoji（ESC 關閉選單）";
+    Utils::setStatusMessage(state, msg);
+
+    DWORD now = GetTickCount();
+    if (now - g_lastEmojiStatusPaintTick >= kEmojiStatusPaintIntervalMs) {
+        g_lastEmojiStatusPaintTick = now;
+        if (state.hWnd) InvalidateRect(state.hWnd, nullptr, FALSE);
+    }
+}
+
+} // namespace
+
 void selectEmoji(GlobalState& state, const std::wstring& emoji) {
     if (emoji.empty()) return;
     if (state.bufferMode) {
         BufferManager::insertTextAtCursor(state, emoji);
-        Utils::updateStatus(state, L"已插入 " + emoji + L"（Emoji 選單仍開啟，ESC 關閉）");
+    } else if (state.showPunctMenu) {
+        InputHandler::queueTextDirectUnicode(emoji);
     } else {
         InputHandler::sendTextDirectUnicode(emoji);
-        Utils::updateStatus(state, L"已插入 " + emoji + L"（ESC 關閉選單）");
     }
-    if (state.hCandWnd) InvalidateRect(state.hCandWnd, nullptr, TRUE);
+    refreshEmojiInsertStatus(state, state.bufferMode);
 }
 
 bool updateEmojiFromGitHub(GlobalState& state, bool showProgress) {

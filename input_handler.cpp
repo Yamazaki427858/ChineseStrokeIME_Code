@@ -5,6 +5,7 @@
 #include "window_manager.h"
 #include "ime_manager.h"
 #include <windows.h>
+#include <deque>
 #include <vector>
 
 extern GlobalState g_state;
@@ -19,23 +20,77 @@ static bool isImeOwnedWindow(HWND hwnd) {
            hwnd == g_state.hBufferWnd;
 }
 
-static void focusWindowHwnd(HWND target) {
-    if (!target || !IsWindow(target)) return;
+static bool focusWindowHwnd(HWND target) {
+    if (!target || !IsWindow(target)) return false;
+    if (GetForegroundWindow() == target) return true;
 
+    AllowSetForegroundWindow(ASFW_ANY);
+
+    HWND foreground = GetForegroundWindow();
     DWORD currentThread = GetCurrentThreadId();
     DWORD targetThread = GetWindowThreadProcessId(target, NULL);
-    bool attached = false;
+    DWORD fgThread = foreground ? GetWindowThreadProcessId(foreground, NULL) : 0;
+    bool attachedTarget = false;
+    bool attachedForeground = false;
     if (currentThread != targetThread) {
         AttachThreadInput(currentThread, targetThread, TRUE);
-        attached = true;
+        attachedTarget = true;
+    }
+    if (fgThread && fgThread != currentThread && fgThread != targetThread) {
+        AttachThreadInput(currentThread, fgThread, TRUE);
+        attachedForeground = true;
     }
 
     SetForegroundWindow(target);
-    SetActiveWindow(target);
+    HWND active = GetLastActivePopup(target);
+    SetActiveWindow(active ? active : target);
+    BringWindowToTop(target);
 
-    if (attached) {
+    if (attachedForeground) {
+        AttachThreadInput(currentThread, fgThread, FALSE);
+    }
+    if (attachedTarget) {
         AttachThreadInput(currentThread, targetThread, FALSE);
     }
+    return GetForegroundWindow() == target;
+}
+
+static HWND resolveInsertTarget() {
+    refreshPunctMenuTargetIfNeeded();
+    if (g_state.showPunctMenu && g_state.punctMenuTargetHwnd && IsWindow(g_state.punctMenuTargetHwnd)) {
+        return g_state.punctMenuTargetHwnd;
+    }
+    HWND fg = GetForegroundWindow();
+    if (fg && !isImeOwnedWindow(fg)) return fg;
+    return NULL;
+}
+
+static bool tryFocusInsertTarget(int maxAttempts) {
+    HWND target = resolveInsertTarget();
+    if (!target || !IsWindow(target)) return false;
+
+    for (int i = 0; i < maxAttempts; ++i) {
+        HWND fg = GetForegroundWindow();
+        if (fg == target) return true;
+
+        // 非選單模式：前景已是其他外部程式則不搶焦點
+        if (!g_state.showPunctMenu && fg && !isImeOwnedWindow(fg)) {
+            return fg == target;
+        }
+
+        // 只有點擊 IME 視窗後才主動搶焦點，避免干擾使用者在外部程式的操作
+        if (fg && isImeOwnedWindow(fg)) {
+            if (focusWindowHwnd(target)) return true;
+        } else {
+            return false;
+        }
+    }
+    return GetForegroundWindow() == target;
+}
+
+// 確保目標視窗有焦點
+void ensureTargetWindowFocused() {
+    (void)tryFocusInsertTarget(1);
 }
 
 static void capturePunctMenuTarget(GlobalState& state) {
@@ -52,20 +107,6 @@ void refreshPunctMenuTargetIfNeeded() {
     HWND fg = GetForegroundWindow();
     if (!isImeOwnedWindow(fg)) {
         g_state.punctMenuTargetHwnd = fg;
-    }
-}
-
-// 確保目標視窗有焦點
-void ensureTargetWindowFocused() {
-    refreshPunctMenuTargetIfNeeded();
-
-    HWND fg = GetForegroundWindow();
-    if (!isImeOwnedWindow(fg)) {
-        return;
-    }
-
-    if (g_state.showPunctMenu && g_state.punctMenuTargetHwnd && IsWindow(g_state.punctMenuTargetHwnd)) {
-        focusWindowHwnd(g_state.punctMenuTargetHwnd);
     }
 }
 
@@ -95,28 +136,51 @@ bool isNumpadStrokeVK(const GlobalState& state, DWORD key) {
     return key == nu || key == ni || key == no || key == nj || key == nk;
 }
 
+static void appendUnicodeKeyEvent(std::vector<INPUT>& inputs, wchar_t ch) {
+    INPUT down = {};
+    down.type = INPUT_KEYBOARD;
+    down.ki.wScan = ch;
+    down.ki.dwFlags = KEYEVENTF_UNICODE;
+    inputs.push_back(down);
+
+    INPUT up = down;
+    up.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+    inputs.push_back(up);
+}
+
 static void sendUnicodeInputs(const std::wstring& text) {
     if (text.empty()) return;
     std::vector<INPUT> inputs;
     inputs.reserve(text.size() * 2);
-    for (wchar_t ch : text) {
-        INPUT down = {};
-        down.type = INPUT_KEYBOARD;
-        down.ki.wScan = ch;
-        down.ki.dwFlags = KEYEVENTF_UNICODE;
-        inputs.push_back(down);
 
-        INPUT up = down;
-        up.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
-        inputs.push_back(up);
+    for (size_t i = 0; i < text.size(); ) {
+        wchar_t w1 = text[i];
+        if (w1 >= 0xD800 && w1 <= 0xDBFF && i + 1 < text.size()) {
+            wchar_t w2 = text[i + 1];
+            if (w2 >= 0xDC00 && w2 <= 0xDFFF) {
+                appendUnicodeKeyEvent(inputs, w1);
+                appendUnicodeKeyEvent(inputs, w2);
+                i += 2;
+                continue;
+            }
+        }
+        appendUnicodeKeyEvent(inputs, w1);
+        i += 1;
     }
-    SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
+
+    // 放大單次 SendInput 批次，減少高頻 emoji 連按時的系統呼叫次數
+    const UINT kMaxBatch = 256;
+    for (size_t offset = 0; offset < inputs.size(); offset += kMaxBatch) {
+        size_t remain = inputs.size() - offset;
+        UINT chunk = static_cast<UINT>(remain < kMaxBatch ? remain : kMaxBatch);
+        SendInput(chunk, inputs.data() + offset, sizeof(INPUT));
+    }
 }
 
-void sendTextDirectUnicode(const std::wstring& text) {
+static void sendTextDirectUnicodeCore(const std::wstring& text, bool ensureFocus) {
     if (text.empty()) return;
 
-    if (!g_state.bufferMode) {
+    if (ensureFocus && !g_state.bufferMode) {
         ensureTargetWindowFocused();
     }
     
@@ -146,6 +210,91 @@ void sendTextDirectUnicode(const std::wstring& text) {
             g_state.bufferHasFocus = true;
             SetTimer(g_state.hBufferWnd, 1, 500, NULL);
         }
+    }
+}
+
+void sendTextDirectUnicode(const std::wstring& text) {
+    sendTextDirectUnicodeCore(text, true);
+}
+
+struct PendingUnicodeItem {
+    std::wstring text;
+    int focusRetryCount = 0;
+};
+static std::deque<PendingUnicodeItem> s_pendingUnicodeQueue;
+static bool s_unicodeQueueScheduled = false;
+static const int kMaxQueueFocusRetry = 2;
+static const int kMaxQueueItemsPerPump = 12;
+static const size_t kMaxQueueUtf16PerPump = 96;
+
+void queueTextDirectUnicode(const std::wstring& text) {
+    if (text.empty()) return;
+    PendingUnicodeItem item;
+    item.text = text;
+    item.focusRetryCount = 0;
+    s_pendingUnicodeQueue.push_back(item);
+    if (g_state.hWnd && !s_unicodeQueueScheduled) {
+        s_unicodeQueueScheduled = true;
+        PostMessageW(g_state.hWnd, WM_USER + 105, 0, 0);
+    }
+}
+
+void processQueuedTextDirectUnicode() {
+    if (s_pendingUnicodeQueue.empty()) {
+        s_unicodeQueueScheduled = false;
+        return;
+    }
+
+    bool focusReady = true;
+    if (!g_state.bufferMode) {
+        // 每輪只嘗試一次焦點恢復，避免連按時重複搶焦點造成抖動
+        focusReady = tryFocusInsertTarget(2);
+    }
+
+    if (!focusReady) {
+        PendingUnicodeItem item = s_pendingUnicodeQueue.front();
+        s_pendingUnicodeQueue.pop_front();
+        if (item.focusRetryCount < kMaxQueueFocusRetry) {
+            item.focusRetryCount++;
+            s_pendingUnicodeQueue.push_back(std::move(item));
+        } else {
+            Utils::setStatusMessage(g_state, L"Emoji 插入失敗：焦點切換逾時");
+            if (g_state.hWnd) InvalidateRect(g_state.hWnd, nullptr, FALSE);
+        }
+    } else {
+        int processed = 0;
+        size_t utf16Count = 0;
+        std::wstring mergedText;
+        mergedText.reserve(64);
+
+        while (!s_pendingUnicodeQueue.empty() &&
+               processed < kMaxQueueItemsPerPump &&
+               utf16Count < kMaxQueueUtf16PerPump) {
+            PendingUnicodeItem item = std::move(s_pendingUnicodeQueue.front());
+            s_pendingUnicodeQueue.pop_front();
+            if (item.text.empty()) continue;
+
+            if (!mergedText.empty() &&
+                utf16Count + item.text.size() > kMaxQueueUtf16PerPump) {
+                // 超過本輪 UTF-16 預算，留到下一輪處理
+                s_pendingUnicodeQueue.push_front(std::move(item));
+                break;
+            }
+
+            mergedText += item.text;
+            utf16Count += item.text.size();
+            ++processed;
+        }
+
+        if (!mergedText.empty()) {
+            sendTextDirectUnicodeCore(mergedText, false);
+        }
+    }
+
+    if (!s_pendingUnicodeQueue.empty() && g_state.hWnd) {
+        PostMessageW(g_state.hWnd, WM_USER + 105, 0, 0);
+    } else {
+        s_unicodeQueueScheduled = false;
     }
 }
 
@@ -347,8 +496,7 @@ void switchPunctMenuMode(GlobalState& state, PunctMenuMode mode) {
     WindowManager::positionWindowsOptimized(state);
     if (state.hInputWnd) ShowWindow(state.hInputWnd, SW_HIDE);
     if (state.hCandWnd) {
-        InvalidateRect(state.hCandWnd, nullptr, TRUE);
-        UpdateWindow(state.hCandWnd);
+        InvalidateRect(state.hCandWnd, nullptr, FALSE);
     }
 }
 
@@ -374,10 +522,10 @@ void showPunctMenu(GlobalState& state) {
 
     WindowManager::switchMode(state, InputMode::CAND_MODE);
     if (state.hInputWnd) ShowWindow(state.hInputWnd, SW_HIDE);
-    if (state.hWnd) SetTimer(state.hWnd, 991, 250, NULL);
+    if (state.hWnd) SetTimer(state.hWnd, 991, 400, NULL);
     WindowManager::positionWindowsOptimized(state);
     if (state.hCandWnd) {
-        InvalidateRect(state.hCandWnd, nullptr, TRUE);
+        InvalidateRect(state.hCandWnd, nullptr, FALSE);
     }
     
     Utils::updateStatus(state, L"標點／Emoji 選單（ESC 關閉，可切換 Emoji 分頁）");
