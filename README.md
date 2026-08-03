@@ -3,7 +3,7 @@
 <br>
 <br>
 # 下載最新版本的ChineseStrokeIME和原始碼
-### 2026年6月最新版本： 中文筆劃輸入法 V3.3.1
+### 2026年8月最新版本： 中文筆劃輸入法 V3.3.2
 💾下載：https://github.com/Yamazaki427858/ChineseStrokeIME_Releases/releases
 <br>
 <br>
@@ -27,7 +27,20 @@
 [![Downloads](https://img.shields.io/github/downloads/Yamazaki427858/ChineseStrokeIME_Releases/total)](https://github.com/Yamazaki427858/ChineseStrokeIME_Releases/releases)
 <br>
 <br>
+## ✨ V3.3.2 優化更新
+## ⌨ 標點符號選單支援方向鍵與滾輪翻頁
+標點符號選取操作更直覺：
+- **方向鍵翻頁**：↑／↓ 可在標點候選中前後翻頁
+- **滑鼠滾輪翻頁**：游標在標點選單上時，滾輪即可翻頁
 
+
+## 🧰 工具列預設縮小顯示
+啟動後的預設外觀調整：
+- **預設為縮小工具列**：新安裝或預設設定下，工具列以精簡模式顯示（僅劃／E 等精簡按鍵）
+- 減少佔用螢幕空間，日常輸入時畫面更乾淨
+- 可於工具列右鍵選單切回完整顯示
+
+---
 ## ✨ V3.3.1 優化更新
 ## 😀 優化 Emoji 連按輸入
 
