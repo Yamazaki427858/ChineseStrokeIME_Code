@@ -527,6 +527,43 @@ static int emojiFooterH(const GlobalState& state) {
 static int emojiCategoryTabW(const GlobalState& state) {
     return emojiCellSize(state);
 }
+
+static int emojiCategoryMaxVisible(const GlobalState& state) {
+    if (!state.hCandWnd) return 1;
+    RECT rc;
+    GetClientRect(state.hCandWnd, &rc);
+    const int pad = 8;
+    int catLeft = pad + EMOJI_SCROLL_BTN_W + 2;
+    int catRight = rc.right - pad - EMOJI_SCROLL_BTN_W - 2;
+    return std::max(1, (catRight - catLeft) / emojiCategoryTabW(state));
+}
+
+static void ensureEmojiCategoryVisible(GlobalState& state) {
+    int gi = state.emojiGroupIndex;
+    int maxVisible = emojiCategoryMaxVisible(state);
+    int n = (int)state.emojiGroups.size();
+    if (gi < state.emojiCategoryScroll) {
+        state.emojiCategoryScroll = gi;
+    } else if (gi >= state.emojiCategoryScroll + maxVisible) {
+        state.emojiCategoryScroll = gi - maxVisible + 1;
+    }
+    if (state.emojiCategoryScroll > n - maxVisible) {
+        state.emojiCategoryScroll = std::max(0, n - maxVisible);
+    }
+}
+
+static void changeEmojiCategory(GlobalState& state, int direction) {
+    if (state.emojiGroups.empty()) return;
+    int n = (int)state.emojiGroups.size();
+    int gi = state.emojiGroupIndex;
+    int next = gi + direction;
+    if (next < 0 || next >= n) return;
+    Dictionary::applyEmojiGroupDisplay(state, next);
+    ensureEmojiCategoryVisible(state);
+    positionWindowsOptimized(state);
+    scheduleDeferredInvalidate(DEFERRED_CAND);
+}
+
 static int emojiModeTabW(const GlobalState& state) {
     return std::max(44, state.candidateFontSize * 3);
 }
@@ -1595,6 +1632,12 @@ LRESULT handleKeyboardInput(HWND hwnd, WPARAM wp) {
             InvalidateRect(hwnd, nullptr, TRUE);
             return 0;
         }
+        if (key == VK_DOWN) { Dictionary::changePage(g_state, 1); return 0; }
+        if (key == VK_UP) { Dictionary::changePage(g_state, -1); return 0; }
+        if (g_state.punctMenuMode == PunctMenuMode::EMOJI) {
+            if (key == VK_LEFT) { changeEmojiCategory(g_state, -1); return 0; }
+            if (key == VK_RIGHT) { changeEmojiCategory(g_state, 1); return 0; }
+        }
         if (g_state.punctMenuMode == PunctMenuMode::PUNCT && key >= '1' && key <= '9') {
             Dictionary::selectCandidate(g_state, key - '1');
             return 0;
@@ -1723,7 +1766,6 @@ static void handleUpdateEmojiFromGitHubMenu(HWND hwnd) {
 
 LRESULT handleCommand(HWND hwnd, WPARAM wp) {
     switch (LOWORD(wp)) {
-        case 1001: InputHandler::showPunctMenu(g_state); break;
         case 1002: 
             Dictionary::loadMainDict(g_state);
             Utils::updateStatus(g_state, L"字碼表已重新載入");
@@ -2198,7 +2240,7 @@ LRESULT CALLBACK CandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         case WM_MOUSEWHEEL: {
-            if (g_state.showPunctMenu) {
+            if (g_state.showPunctMenu || (g_state.showCand && g_state.totalPages > 1)) {
                 short delta = GET_WHEEL_DELTA_WPARAM(wp);
                 if (delta > 0 && g_state.currentPage > 0) {
                     Dictionary::changePage(g_state, -1);
@@ -2494,6 +2536,19 @@ LRESULT CALLBACK PredProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             
             return 0; 
+        }
+
+        case WM_MOUSEWHEEL: {
+            if (g_state.showCand && g_state.totalPages > 1) {
+                short delta = GET_WHEEL_DELTA_WPARAM(wp);
+                if (delta > 0 && g_state.currentPage > 0) {
+                    Dictionary::changePage(g_state, -1);
+                } else if (delta < 0 && g_state.currentPage < g_state.totalPages - 1) {
+                    Dictionary::changePage(g_state, 1);
+                }
+                return 0;
+            }
+            break;
         }
         
         case WM_RBUTTONDOWN: {
@@ -3949,7 +4004,6 @@ static void trackMainToolbarPopupMenu(HWND hwnd) {
     if (!hMenu) {
         return;
     }
-    AppendMenu(hMenu, MF_STRING, 1001, L"標點符號選單");
     AppendMenu(hMenu, MF_STRING, 1002, L"重新載入字碼表");
     AppendMenu(hMenu, MF_STRING, 1008, L"從GitHub更新字碼表");
     AppendMenu(hMenu, MF_STRING, 1021, L"從GitHub更新Emoji");

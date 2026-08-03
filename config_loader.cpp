@@ -151,8 +151,8 @@ static void createDefaultConfigFile(GlobalState& state) {
     fout << "showStrokeSymbols=1" << std::endl;
     fout << "; 螢幕模式變更提示（0=靜默處理 預設，1=彈出提示）" << std::endl;
     fout << "showScreenModeNotification=0" << std::endl;
-    fout << "; 縮小顯示工作列（僅劃／E 兩鍵；於列上右鍵開啟選單）（0=關閉 預設）" << std::endl;
-    fout << "toolbarClassicModeBadges=0" << std::endl;
+    fout << "; 縮小顯示工作列（僅劃／E 兩鍵；於列上右鍵開啟選單）（1=開啟 預設，0=關閉）" << std::endl;
+    fout << "toolbarClassicModeBadges=1" << std::endl;
     fout << "; 啟動自動檢查版本：發現新版本時不再彈窗提醒（0=仍提醒 預設，1=不再提醒）" << std::endl;
     fout << "; 改回 0 可恢復提醒；「關於」內的手動檢查不受此項影響" << std::endl;
     fout << "suppress_version_update_reminder=0" << std::endl;

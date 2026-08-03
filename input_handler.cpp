@@ -677,7 +677,10 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                         key == static_cast<DWORD>(g_state.wildcardKey1VK) ||
                         key == static_cast<DWORD>(g_state.wildcardKey2VK);
                     bool isStrokeKey = (isStrokeLetterVK(g_state, key) || key == 'P' || isWildcardKey);
-                    shouldIntercept = !isStrokeKey;
+                    // 標點/Emoji 選單開啟時：筆劃鍵與其他字母一致改送英文，避免漏攔直通系統
+                    // （P 仍交給後段作為選單控制鍵，不在此轉英文）
+                    shouldIntercept = !isStrokeKey ||
+                                      (g_state.showPunctMenu && key != 'P');
                 } else {
                     // 英文模式：攔截所有字母鍵，統一由本輸入法送英文，避免與 Windows 自帶輸入法衝突
                     shouldIntercept = true;
@@ -1179,8 +1182,13 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 
                 bool isFunctionKey = false;
                 if (g_state.showPunctMenu) {
-                    // 選單開啟時僅攔截選單專用鍵，其餘（Backspace、方向鍵、一般輸入）交給前景程式
+                    // 選單開啟時攔截翻頁／選字／關閉鍵；Backspace 與一般輸入仍交給前景程式
                     if (key == VK_ESCAPE || key == 'P') {
+                        isFunctionKey = true;
+                    } else if (key == VK_UP || key == VK_DOWN) {
+                        isFunctionKey = true;
+                    } else if (g_state.punctMenuMode == PunctMenuMode::EMOJI &&
+                               (key == VK_LEFT || key == VK_RIGHT)) {
                         isFunctionKey = true;
                     } else if (g_state.punctMenuMode == PunctMenuMode::PUNCT &&
                                key >= '1' && key <= '9') {
@@ -1197,6 +1205,10 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                         refreshPunctMenuTargetIfNeeded();
                         if (isFunctionKey) {
                             PostMessage(g_state.hWnd, WM_USER+100, key, 0);
+                            return 1;
+                        }
+                        // 字母筆劃鍵已在上方 A-Z 分支轉成英文；其餘筆劃/萬用鍵在此吞掉，避免漏攔
+                        if (isStrokeKey) {
                             return 1;
                         }
                         return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);

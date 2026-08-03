@@ -25,7 +25,7 @@ enum class InputMode {
 // 例如：3.1.0、Beta4.0.a、3.0.0-alpha、v2.0.0-beta.1 等均可
 // 版本比較：使用字符串比較，只要字符串不同即判定為不同版本
 //
-#define APP_VERSION "3.3.1"
+#define APP_VERSION "3.3.2"
 // ========== 【版本號定義結束】 ==========
 
 // 常數定義
@@ -311,7 +311,7 @@ struct GlobalState {
     // 啟動自動檢查發現新版本時不再彈窗（interfaceconfig.ini [WindowBehavior]，預設 false）
     bool suppressVersionUpdateReminder = false;
     // 迷你「劃／E」工具列（僅兩鍵＋右鍵選單；interfaceconfig.ini [WindowBehavior]，預設關閉）
-    bool toolbarClassicModeBadges = false;
+    bool toolbarClassicModeBadges = true;
     
     // 萬用字元 * 觸發鍵（3+3 模式用，對應虛擬鍵碼，預設為 L 與 NumPad0）
     int wildcardKey1VK = 'L';
